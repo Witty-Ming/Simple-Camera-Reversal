@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "simple_camera_match"
+version = "1.0.0"
+type = "add-on"
+name = "简易相机反求"
+tagline = "通过绘制线条反求相机视角"
+maintainer = "WittyMing"
+license = [
+  "SPDX:GPL-3.0-or-later"
+]
+
+# 扩展系统是在 Blender 4.2 中引入的
+blender_version_min = "4.2.0"
+
+# 可选项
+tags = ["Camera", "3D View"]
