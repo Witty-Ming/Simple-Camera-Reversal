@@ -35,6 +35,11 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.last_error = ""
         context.scene.cmp_data.active_index = -1
         context.scene.cmp_data.is_drawing_mode = True 
+        try:
+            from . import gpu_draw
+            gpu_draw.register()
+        except:
+            pass
         
         context.window_manager.modal_handler_add(self)
         self.update_header(context)
@@ -185,6 +190,12 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             
         context.area.header_text_set(None)
         context.window.cursor_modal_restore()
+        
+        try:
+            from . import gpu_draw
+            gpu_draw.unregister()
+        except:
+            pass
 
     # --- 辅助函数 ---
     def screen_to_norm(self, context, x, y):

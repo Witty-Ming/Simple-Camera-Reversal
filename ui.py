@@ -31,9 +31,7 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         row.prop(scene.cmp_data, "world_rotation", text="World Rotation (XY)")
         row.prop(scene.cmp_data, "flip_z_axis", text="Flip Z Axis", icon='TRIA_UP' if not scene.cmp_data.flip_z_axis else 'TRIA_DOWN', toggle=True)
         
-        row = col.row()
-        row.operator("cmp.clear_lines", text="Clear All Lines", icon='TRASH')
-        
+
         layout.separator()
 
         # 3. 说明

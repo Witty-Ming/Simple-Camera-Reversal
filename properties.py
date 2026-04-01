@@ -16,6 +16,7 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
     last_world_rotation: bpy.props.FloatProperty(default=0.0)
     last_flip_z: bpy.props.BoolProperty(default=False)
 
+
     def update_rotation(self, context):
         import mathutils
         import math
@@ -55,6 +56,7 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         update=update_rotation
     )
     
+
 def register():
     try:
         bpy.utils.register_class(CMP_Line)
