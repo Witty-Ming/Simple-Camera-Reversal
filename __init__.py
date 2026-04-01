@@ -21,7 +21,6 @@ from . import translation
 def register():
     translation.register()
     properties.register()
-    gpu_draw.register()
     ui.register()
     operators.register()
     tool.register()

@@ -164,35 +164,14 @@ class CMP_OT_MatchCamera(bpy.types.Operator):
             self.report({'WARNING'}, msg)
             return {'CANCELLED'}
 
-class CMP_OT_ClearLines(bpy.types.Operator):
-    """Clear All Lines"""
-    bl_idname = "cmp.clear_lines"
-    bl_label = "Clear All Lines"
-    bl_options = {'REGISTER', 'UNDO'}
-    
-    def execute(self, context):
-        context.scene.cmp_data.lines.clear()
-        context.area.tag_redraw()
-        return {'FINISHED'}
-
 def register():
     try:
         bpy.utils.register_class(CMP_OT_MatchCamera)
     except ValueError:
         bpy.utils.unregister_class(CMP_OT_MatchCamera)
         bpy.utils.register_class(CMP_OT_MatchCamera)
-        
-    try:
-        bpy.utils.register_class(CMP_OT_ClearLines)
-    except ValueError:
-        bpy.utils.unregister_class(CMP_OT_ClearLines)
-        bpy.utils.register_class(CMP_OT_ClearLines)
 
 def unregister():
-    try:
-        bpy.utils.unregister_class(CMP_OT_ClearLines)
-    except: pass
-    
     try:
         bpy.utils.unregister_class(CMP_OT_MatchCamera)
     except: pass
