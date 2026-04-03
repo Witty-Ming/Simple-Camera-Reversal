@@ -52,6 +52,6 @@ data = {
     "Red X": "红X",
     "Green Y": "绿Y",
     "Blue Z": "蓝Z",
-    "CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Right click exit": "相机反求 [3D]: 轴向 %s (1/2/3键切换)。拖拽以绘制 | 点击端点以编辑 | Ctrl+Z 撤销 | 右键退出",
+    "CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Alt+X clear all | Right click exit": "相机反求 [3D]: 轴向 %s (1/2/3键切换)。拖拽以绘制 | 点击端点以编辑 | Ctrl+Z 撤销 | Alt+X 清除全部 | 右键退出",
     " | Error: ": " | 错误: ",
 }

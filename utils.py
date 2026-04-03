@@ -73,9 +73,22 @@ def solve_vanishing_point_2d(lines, weights=None, image_diag=2000.0):
         if weights.max() > 0:
             weights /= weights.max()
             
+    # 当只有2条线时，使用均匀权重
+    if n == 2:
+        weights = np.ones(n)
+    
     # 第一遍：初始加权求解
     vp = solve_weighted_svd(lines, weights)
     if vp is None: return None
+    
+    # 当只有2条线时，验证消失点的合理性
+    if n == 2:
+        # 检查消失点是否在合理范围内
+        if np.linalg.norm(vp) > image_diag * 5:
+            # 消失点太远，可能是平行线情况，返回None
+            return None
+        # 直接返回，不进行异常值抑制
+        return vp
     
     # 第二遍：异常值抑制 (平滑)
     # 计算从 VP 到线条的几何距离
@@ -150,10 +163,12 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
     vp_data: {'X':(u,v), ...} 以中心像素为单位
     axis_weights: {'X': count, ...} 各轴的线段数量权重
     返回 f_mm, rot_matrix, shift_x, shift_y, new_location
+    
+    增强版：添加焦距合理性验证和置信度评估。
     """
     # 1. 像主点 (Principal Point) & 偏移
     # 默认为 0,0 (中心)，除非用户特别希望求解偏移
-    # 对于“保持世界原点在中心”，偏移必须为 0。
+    # 对于"保持世界原点在中心"，偏移必须为 0。
     shift_x = 0.0
     shift_y = 0.0
     principal_point = np.array([0.0, 0.0])
@@ -164,7 +179,7 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
     # 3. 焦距
     def calc_f(v1, v2):
         # 过滤：如果 VP 太远（不稳定），则返回 None
-        # 阈值：图像尺寸的 10 倍对于“近似平行”是安全的
+        # 阈值：图像尺寸的 10 倍对于"近似平行"是安全的
         # 如果 > 阈值，点积主要由位置决定，对噪声敏感。
         limit = 10.0 * max(pixel_width, pixel_height)
         if np.linalg.norm(v1) > limit or np.linalg.norm(v2) > limit:
@@ -173,6 +188,39 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
         d = np.dot(v1, v2)
         if d < 0: return np.sqrt(-d)
         return None
+    
+    def validate_focal_length(f_pixels, default_f_pixels, pixel_width, pixel_height):
+        """
+        验证焦距的合理性。
+        返回 (is_valid, confidence_score)
+        """
+        if f_pixels is None or f_pixels <= 0:
+            return False, 0.0
+        
+        # 检查焦距是否在合理范围内
+        # 一般相机焦距在 10mm-300mm 之间，对应像素焦距在图像高度的 0.5-15 倍
+        min_f = pixel_height * 0.3
+        max_f = pixel_height * 20.0
+        
+        if f_pixels < min_f or f_pixels > max_f:
+            return False, 0.0
+        
+        # 计算与默认焦距的差异率
+        diff_ratio = abs(f_pixels - default_f_pixels) / default_f_pixels
+        
+        # 差异越小，置信度越高
+        if diff_ratio < 0.1:
+            confidence = 0.9
+        elif diff_ratio < 0.3:
+            confidence = 0.7
+        elif diff_ratio < 0.5:
+            confidence = 0.5
+        elif diff_ratio < 1.0:
+            confidence = 0.3
+        else:
+            confidence = 0.1
+        
+        return True, confidence
         
     # 计算默认焦距的像素值，用于并未参考
     default_f_pixels = get_effective_f_pixels(default_f_mm, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height)
@@ -256,6 +304,20 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
                      f_pixels = best_sub_choice[0]
                      trusted_axes = best_sub_choice[1]
 
+        # 验证焦距合理性
+        is_valid, confidence = validate_focal_length(f_pixels, default_f_pixels, pixel_width, pixel_height)
+        
+        if not is_valid:
+            # 如果焦距不合理，使用默认焦距
+            f_pixels = default_f_pixels
+            # 保持所有轴为可信
+            trusted_axes = set(vp_data_shifted.keys())
+        
+        # 根据置信度调整焦距
+        if confidence < 0.5:
+            # 低置信度时，向默认焦距靠拢
+            blend_factor = 1.0 - confidence  # 置信度越低，混合比例越高
+            f_pixels = f_pixels * (1.0 - blend_factor) + default_f_pixels * blend_factor
         
         # 使用 Robust Helper 基于传感器适配将 f_pixels 转换为 f_mm
         # 逻辑：f_mm = f_pixels / effective_pixel_size * sensor_size
@@ -277,8 +339,12 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
         else:
              val_mm = (f_pixels / pixel_width) * sensor_width_mm
 
-        if 5.0 < val_mm < 5000.0:
+        # 更严格的焦距范围检查
+        if 10.0 < val_mm < 2000.0:
             f_mm_final = val_mm
+        else:
+            # 焦距超出范围，使用默认值
+            f_mm_final = default_f_mm
             
     # 重新计算 f_pixels (旋转向量需要)
     # 必须反相使用相同的逻辑以获得一致的像素值

@@ -51,7 +51,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             iface_ = bpy.app.translations.pgettext_iface
             cols = {'X': iface_('Red X'), 'Y': iface_('Green Y'), 'Z': iface_('Blue Z')}
             c = cols.get(self.current_axis, "")
-            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Right click exit") % c
+            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Alt+X clear all | Right click exit") % c
             
             if self.last_error:
                 msg = base + iface_(" | Error: ") + iface_(self.last_error)
@@ -80,6 +80,18 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                     context.scene.cmp_data.active_index = -1
                     self.state = self.STATE_IDLE
                     self.trigger_solve(context)
+                return {'RUNNING_MODAL'}
+            
+            # Alt+X: 清除所有线段
+            if event.alt and event.type == 'X':
+                lines = context.scene.cmp_data.lines
+                while len(lines) > 0:
+                    lines.remove(len(lines)-1)
+                context.scene.cmp_data.active_index = -1
+                self.state = self.STATE_IDLE
+                self.last_error = ""
+                self.update_header(context)
+                context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
                 
             if event.type in {'ONE', 'NUMPAD_1'}: self.current_axis = 'X'; self.update_header(context)
