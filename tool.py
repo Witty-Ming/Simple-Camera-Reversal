@@ -1,4 +1,5 @@
 import bpy
+import sys
 import numpy as np
 import bpy_extras
 from mathutils import Vector
@@ -54,12 +55,19 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         context.area.tag_redraw()
         return {'RUNNING_MODAL'}
 
+    def primary_modifier_pressed(self, event):
+        return event.ctrl or getattr(event, "oskey", False)
+
+    def primary_modifier_label(self):
+        return 'Cmd' if sys.platform == 'darwin' else 'Ctrl'
+
     def update_header(self, context):
         try:
             iface_ = bpy.app.translations.pgettext_iface
             cols = {'X': iface_('Red X'), 'Y': iface_('Green Y'), 'Z': iface_('Blue Z')}
             c = cols.get(self.current_axis, "")
-            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Ctrl+Shift+Z redo | Alt+X clear all | Right click exit") % c
+            mod = self.primary_modifier_label()
+            base = iface_("CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | %s+Z undo | %s+Shift+Z redo | Alt+X clear all | Esc / Right click exit") % (c, mod, mod)
 
             if self.last_error:
                 msg = base + iface_(" | Error: ") + iface_(self.last_error)
@@ -86,11 +94,11 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             return {'RUNNING_MODAL'}
 
         if event.value == 'PRESS':
-            if event.ctrl and event.shift and event.type == 'Z':
+            if self.primary_modifier_pressed(event) and event.shift and event.type == 'Z':
                 self.redo(context)
                 return {'RUNNING_MODAL'}
 
-            if event.ctrl and event.type == 'Z':
+            if self.primary_modifier_pressed(event) and event.type == 'Z':
                 self.undo(context)
                 return {'RUNNING_MODAL'}
 

@@ -17,7 +17,7 @@ data = {
     "1/2/3 Key : Switch X/Y/Z Axis": "1/2/3键 : 切换 X/Y/Z 轴",
     "Drag : Draw | Click : Edit": "拖拽 : 绘制 | 点击 : 编辑",
     "X Key : Delete Line": "X键 : 删除线条",
-    "Right Click : Exit": "右键 : 退出",
+    "Esc / Right Click : Exit": "Esc / 右键 : 退出",
     "Tip: Draw one or no parallel edges": "建议:平行边只画一条或者不画",
     "Tip: Draw at least 3 perspective edges": "建议:透视边至少画三条或以上",
     "Focal Length (mm)": "焦距(mm)",
@@ -64,6 +64,6 @@ data = {
     "Red X": "红X",
     "Green Y": "绿Y",
     "Blue Z": "蓝Z",
-    "CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | Ctrl+Z undo | Ctrl+Shift+Z redo | Alt+X clear all | Right click exit": "相机反求 [3D]: 轴向 %s (1/2/3键切换)。拖拽以绘制 | 点击端点以编辑 | Ctrl+Z 撤销 | Ctrl+Shift+Z 恢复 | Alt+X 清除全部 | 右键退出",
+    "CameraMatch [3D]: Axis %s (1/2/3). Drag to draw | Click dot to edit | %s+Z undo | %s+Shift+Z redo | Alt+X clear all | Esc / Right click exit": "相机反求 [3D]: 轴向 %s (1/2/3键切换)。拖拽以绘制 | 点击端点以编辑 | %s+Z 撤销 | %s+Shift+Z 恢复 | Alt+X 清除全部 | Esc / 右键退出",
     " | Error: ": " | 错误: ",
 }

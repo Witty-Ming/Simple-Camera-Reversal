@@ -43,7 +43,7 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         col.label(text="1/2/3 Key : Switch X/Y/Z Axis")
         col.label(text="Drag : Draw | Click : Edit")
         col.label(text="X Key : Delete Line")
-        col.label(text="Right Click : Exit")
+        col.label(text="Esc / Right Click : Exit")
         col.label(text="--------------------------")
         col.label(text="Tip: Draw one or no parallel edges")
         col.label(text="Tip: Draw at least 3 perspective edges")
