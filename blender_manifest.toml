@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 blender_version_min = "4.2.0"
-version = "1.0.3"
+version = "1.0.6"
 id = "simple_camera_match"
 name = "Simple Camera Match"
 tagline = "Simple Camera Match - Blender插件"

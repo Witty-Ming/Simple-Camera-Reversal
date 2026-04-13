@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Simple Camera Match",
     "author": "WittyMing",
-    "version": (1, 0, 5),
+    "version": (1, 0, 6),
     "blender": (4, 2, 0),
     "location": "View3D > N-Panel > CameraMatch",
     "description": "Reconstruct camera perspective by drawing lines",
