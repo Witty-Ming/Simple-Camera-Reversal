@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 blender_version_min = "4.2.0"
-version = "1.1.1"
+version = "1.1.2"
 id = "simple_camera_match"
 name = "Simple Camera Match"
 tagline = "Simple Camera Match - Blender插件"
@@ -10,4 +10,4 @@ type = "add-on"
 website = "https://space.bilibili.com/263206115"
 copyright = ["WittyMing"]
 tags = ["Object","3D View","Scene"]
-platforms = ["windows-arm64","windows-x64","macos-arm64","macos-x64"]
+platforms = ["windows-arm64","windows-x64","macos-arm64","macos-x64","linux-x64"]
