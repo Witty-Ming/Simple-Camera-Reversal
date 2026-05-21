@@ -2,7 +2,8 @@ import bpy
 
 from . import zh_HANS
 
-TRANSLATION_DOMAIN = "simple_camera_match"
+
+TRANSLATION_DOMAIN = "wittyming_color_palette"
 
 LANGS = {
     "zh_CN": zh_HANS.data,
@@ -34,8 +35,8 @@ def register():
 
     try:
         bpy.app.translations.register(TRANSLATION_DOMAIN, TRANSLATIONS_DICT)
-    except Exception as e:
-        print(f"[SimpleCameraMatch] Translation register error: {e}")
+    except Exception:
+        pass
 
 
 def unregister():
