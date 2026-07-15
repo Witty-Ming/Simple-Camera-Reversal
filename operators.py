@@ -15,10 +15,16 @@ def solve_camera_core(context):
     """
     scene = context.scene
     cam = scene.camera
-    if not cam: return False, "No Active Camera"
+    if not cam:
+        return False, "No Active Camera"
+
+    if getattr(cam.data, "type", None) != 'PERSP':
+        iface_ = bpy.app.translations.pgettext_iface
+        return False, iface_("Only perspective cameras are supported")
 
     lines = scene.cmp_data.lines
-    if len(lines) < 2: return False, "Not enough lines"
+    if len(lines) < 2:
+        return False, "Not enough lines"
 
     render = scene.render
     pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
@@ -462,7 +468,6 @@ def solve_camera_core(context):
         return False, iface_("Failed to apply camera transform")
     finally:
         properties.resume_horizon_updates()
-        properties.reset_horizon_solve_state()
         utils.restore_camera_view_state(view_state)
 
 

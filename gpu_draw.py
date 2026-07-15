@@ -8,13 +8,20 @@ from bpy_extras import view3d_utils
 from . import utils
 
 _handle = None
+_shader_2d_color = None
 
 
 def get_shader_2d_color():
-    try:
-        return gpu.shader.from_builtin('2D_UNIFORM_COLOR')
-    except Exception:
-        return gpu.shader.from_builtin('UNIFORM_COLOR')
+    global _shader_2d_color
+    if _shader_2d_color is not None:
+        return _shader_2d_color
+
+    _shader_2d_color = gpu.shader.from_builtin('UNIFORM_COLOR')
+    return _shader_2d_color
+
+
+def to_shader_positions(points):
+    return [(float(point[0]), float(point[1]), 0.0) for point in points]
 
 
 # 生成虚线顶点阵列
@@ -237,22 +244,37 @@ def draw_callback():
         shader = get_shader_2d_color()
         shader.bind()
 
-        gpu.state.blend_set('ALPHA')
+        try:
+            gpu.state.blend_set('ALPHA')
 
-        for color, data in batches.items():
-            shader.uniform_float("color", color)
+            for color, data in batches.items():
+                shader.uniform_float("color", color)
 
-            if data['TRIS']:
-                batch = batch_for_shader(shader, 'TRIS', {"pos": data['TRIS']})
-                batch.draw(shader)
+                if data['TRIS']:
+                    batch = batch_for_shader(
+                        shader,
+                        'TRIS',
+                        {"pos": to_shader_positions(data['TRIS'])},
+                    )
+                    batch.draw(shader)
 
-            if data['LINES']:
-                gpu.state.line_width_set(2)
-                batch = batch_for_shader(shader, 'LINES', {"pos": data['LINES']})
-                batch.draw(shader)
+                if data['LINES']:
+                    gpu.state.line_width_set(2)
+                    try:
+                        batch = batch_for_shader(
+                            shader,
+                            'LINES',
+                            {"pos": to_shader_positions(data['LINES'])},
+                        )
+                        batch.draw(shader)
+                    finally:
+                        gpu.state.line_width_set(1)
+        finally:
+            # 绘制回调共享 Blender 的 GPU 状态，任何异常都必须恢复现场。
+            try:
                 gpu.state.line_width_set(1)
-
-        gpu.state.blend_set('NONE')
+            finally:
+                gpu.state.blend_set('NONE')
 
     except Exception as e:
         print(f"CMP 2D Draw Error: {e}")
@@ -286,9 +308,19 @@ def register():
 
 def unregister():
     global _handle
+    global _shader_2d_color
     if _handle:
-        bpy.types.SpaceView3D.draw_handler_remove(_handle, 'WINDOW')
-        _handle = None
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_handle, 'WINDOW')
+        except Exception as e:
+            print(f"[CameraMatch] 移除绘制回调失败: {e}")
+        finally:
+            _handle = None
 
-    if bpy.app.timers.is_registered(redraw_timer):
-        bpy.app.timers.unregister(redraw_timer)
+    try:
+        if bpy.app.timers.is_registered(redraw_timer):
+            bpy.app.timers.unregister(redraw_timer)
+    except Exception as e:
+        print(f"[CameraMatch] 注销重绘定时器失败: {e}")
+
+    _shader_2d_color = None

@@ -1,213 +1,337 @@
-import json
-
 import bpy
+import numpy as np
+import bpy_extras
+from types import SimpleNamespace
 
-from .constants import ZERO_COLOR
-
-iface_ = bpy.app.translations.pgettext_iface
-
-
-_CAPTURE_LOCK = False
-_SYNC_LOCK = False
-_PALETTE_DATA_VERSION = 1
+from . import utils
 
 
-def _addon_preferences():
-    package = __package__ or __name__.partition(".")[0]
-    addon = bpy.context.preferences.addons.get(package)
-    if addon:
-        return addon.preferences
-    for key, addon in bpy.context.preferences.addons.items():
-        if key.endswith("wittyming_color_palette"):
-            return addon.preferences
-    return None
+_horizon_update_suppress_depth = 0
 
 
-def _scene_has_palette_props(scene):
-    return bool(
-        scene
-        and hasattr(scene, "WittyMing_color_palette_groups")
-        and hasattr(scene, "WittyMing_color_palette_colors")
+def suppress_horizon_updates():
+    global _horizon_update_suppress_depth
+    _horizon_update_suppress_depth += 1
+
+
+def resume_horizon_updates():
+    global _horizon_update_suppress_depth
+    _horizon_update_suppress_depth = max(0, _horizon_update_suppress_depth - 1)
+
+
+def is_horizon_updates_suppressed():
+    return _horizon_update_suppress_depth > 0
+
+
+def reset_horizon_update_state():
+    global _horizon_update_suppress_depth
+    _horizon_update_suppress_depth = 0
+
+
+def _context_for_scene(scene, context):
+    if scene is None:
+        return None
+
+    if context is not None and getattr(context, "scene", None) == scene:
+        return context
+
+    try:
+        view_layer = scene.view_layers[0] if len(scene.view_layers) > 0 else None
+    except Exception:
+        view_layer = None
+
+    if view_layer is None:
+        return None
+
+    return SimpleNamespace(
+        scene=scene,
+        view_layer=view_layer,
+        screen=None,
+        area=None,
+        space_data=None,
+        region=None,
+        region_data=None,
     )
 
 
-def _clear_scene_palette(scene):
-    while len(scene.WittyMing_color_palette_colors):
-        scene.WittyMing_color_palette_colors.remove(0)
-    while len(scene.WittyMing_color_palette_groups):
-        scene.WittyMing_color_palette_groups.remove(0)
-
-
-def _add_default_group(scene):
-    group = scene.WittyMing_color_palette_groups.add()
-    group.name = "Group 00"
-    scene.WittyMing_color_palette_active_group = 0
-    return group
-
-
-def _palette_payload(scene):
-    groups = [
-        {"name": group.name}
-        for group in scene.WittyMing_color_palette_groups
-    ]
-    colors = [
-        {"name": item.name, "group": int(item.group), "color": [float(value) for value in item.color]}
-        for item in scene.WittyMing_color_palette_colors
-    ]
-    return {
-        "version": _PALETTE_DATA_VERSION,
-        "active_group": int(scene.WittyMing_color_palette_active_group),
-        "groups": groups,
-        "colors": colors,
-    }
-
-
-def sync_palette(scene):
-    if _SYNC_LOCK or not _scene_has_palette_props(scene):
+def _solve_horizon_from_context(context):
+    scene = getattr(context, "scene", None)
+    if scene is None or scene.camera is None:
         return
-    prefs = _addon_preferences()
-    if not prefs:
+
+    if is_horizon_updates_suppressed():
         return
+
+    cmp_data = getattr(scene, "cmp_data", None)
+    if cmp_data is None or len(cmp_data.lines) < 2:
+        return
+
     try:
-        prefs.palette_data = json.dumps(_palette_payload(scene), separators=(",", ":"))
-    except Exception:
-        pass
+        from . import operators
+        operators.solve_camera_core(context)
+    except Exception as e:
+        print(f"[CameraMatch] 地平线解算失败: {e}")
 
 
-def restore_palette(scene):
-    global _SYNC_LOCK
-    if not _scene_has_palette_props(scene):
-        return False
-    prefs = _addon_preferences()
-    data = getattr(prefs, "palette_data", "") if prefs else ""
-    if not data:
-        return False
-    try:
-        payload = json.loads(data)
-        groups = payload.get("groups") or []
-        colors = payload.get("colors") or []
-    except Exception:
-        return False
-
-    _SYNC_LOCK = True
-    try:
-        _clear_scene_palette(scene)
-        if not groups:
-            _add_default_group(scene)
-        else:
-            for index, group_data in enumerate(groups):
-                group = scene.WittyMing_color_palette_groups.add()
-                group.name = str(group_data.get("name") or f"Group {index:02d}")
-        max_group = max(0, len(scene.WittyMing_color_palette_groups) - 1)
-        for index, color_data in enumerate(colors):
-            color = color_data.get("color") or (1.0, 1.0, 1.0, 1.0)
-            item = scene.WittyMing_color_palette_colors.add()
-            item.name = str(color_data.get("name") or f"{index:02d}")
-            item.group = max(0, min(int(color_data.get("group", 0)), max_group))
-            values = [float(value) for value in color[:4]]
-            while len(values) < 4:
-                values.append(1.0)
-            item.color = tuple(values[:4])
-        active_group = int(payload.get("active_group", 0))
-        scene.WittyMing_color_palette_active_group = max(0, min(active_group, max_group))
-    finally:
-        _SYNC_LOCK = False
-    return True
+class CMP_Line(bpy.types.PropertyGroup):
+    start: bpy.props.FloatVectorProperty(size=2, description="Start Point (Normalized)")
+    end: bpy.props.FloatVectorProperty(size=2, description="End Point (Normalized)")
+    axis: bpy.props.StringProperty(default='X', description="Axis (X, Y, Z)")
 
 
-def ensure_palette(scene):
-    if not _scene_has_palette_props(scene):
-        return
-    if restore_palette(scene):
-        return
-    if len(scene.WittyMing_color_palette_groups) == 0:
-        _add_default_group(scene)
-    else:
-        sync_palette(scene)
+class CMP_SceneProperties(bpy.types.PropertyGroup):
+    lines: bpy.props.CollectionProperty(type=CMP_Line)
+    active_index: bpy.props.IntProperty(default=-1)
+    lines_camera: bpy.props.PointerProperty(type=bpy.types.Object, description="Camera bound to current guide lines")
 
+    is_drawing_mode: bpy.props.BoolProperty(default=False)
+    is_creating_line: bpy.props.BoolProperty(default=False)
 
-def add_color(scene, color, group_index=None):
-    if len(scene.WittyMing_color_palette_groups) == 0:
-        add_group(scene, sync=False)
-    if group_index is None:
-        group_index = scene.WittyMing_color_palette_active_group
-    group_index = max(0, min(group_index, len(scene.WittyMing_color_palette_groups) - 1))
-    item = scene.WittyMing_color_palette_colors.add()
-    item.name = f"{len(scene.WittyMing_color_palette_colors):02d}"
-    item.color = color
-    item.group = group_index
-    scene.WittyMing_color_palette_active_group = group_index
-    sync_palette(scene)
+    last_world_rotation: bpy.props.FloatProperty(default=0.0)
+    last_flip_z: bpy.props.BoolProperty(default=False)
 
+    def _update_view_layer(self):
+        scene = getattr(self, "id_data", None)
+        solve_context = _context_for_scene(scene, bpy.context)
+        if solve_context is None:
+            return
+        try:
+            solve_context.view_layer.update()
+        except Exception:
+            pass
 
-def add_group(scene, sync=True):
-    group = scene.WittyMing_color_palette_groups.add()
-    group.name = f"Group {len(scene.WittyMing_color_palette_groups):02d}"
-    for item in scene.WittyMing_color_palette_colors:
-        item.group += 1
-    scene.WittyMing_color_palette_active_group = 0
-    if sync:
-        sync_palette(scene)
-    return group
+    def _compensate_shift_for_cursor_uv(self, scene, cam, target_uv):
+        render = scene.render
+        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
+        if pixel_res_x <= 1e-8 or pixel_res_y <= 1e-8:
+            return
 
+        cursor_location = scene.cursor.location.copy()
+        shift_eps = 1e-4
+        max_shift_step = 0.02
 
-def remove_group(scene, index):
-    groups = scene.WittyMing_color_palette_groups
-    if not (0 <= index < len(groups)) or len(groups) <= 1:
-        return
-    remove_indices = [i for i, item in enumerate(scene.WittyMing_color_palette_colors) if item.group == index]
-    for item_index in reversed(remove_indices):
-        scene.WittyMing_color_palette_colors.remove(item_index)
-    for item in scene.WittyMing_color_palette_colors:
-        if item.group > index:
-            item.group -= 1
-    groups.remove(index)
-    scene.WittyMing_color_palette_active_group = max(0, min(scene.WittyMing_color_palette_active_group, len(groups) - 1))
-    sync_palette(scene)
+        for _ in range(3):
+            cur_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+            if not (np.isfinite(cur_view.x) and np.isfinite(cur_view.y)):
+                break
 
+            err_u = target_uv[0] - float(cur_view.x)
+            err_v = target_uv[1] - float(cur_view.y)
+            err_px = np.hypot(err_u * pixel_res_x, err_v * pixel_res_y)
+            if err_px < 0.25:
+                break
 
-def remove_color(scene, index):
-    if 0 <= index < len(scene.WittyMing_color_palette_colors):
-        scene.WittyMing_color_palette_colors.remove(index)
-        sync_palette(scene)
+            base_shift_x = float(cam.data.shift_x)
+            base_shift_y = float(cam.data.shift_y)
 
+            cam.data.shift_x = base_shift_x + shift_eps
+            self._update_view_layer()
+            view_sx = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
 
-def capture_color_update(scene, context):
-    global _CAPTURE_LOCK
-    if _CAPTURE_LOCK:
-        return
-    color = tuple(scene.WittyMing_color_palette_capture)
-    if color == ZERO_COLOR:
-        return
-    add_color(scene, color)
-    _CAPTURE_LOCK = True
-    try:
-        scene.WittyMing_color_palette_capture = ZERO_COLOR
-    finally:
-        _CAPTURE_LOCK = False
+            cam.data.shift_x = base_shift_x
+            cam.data.shift_y = base_shift_y + shift_eps
+            self._update_view_layer()
+            view_sy = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
 
+            cam.data.shift_y = base_shift_y
+            self._update_view_layer()
 
-class RA_ColorPaletteSlot(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Name", default="Color")
-    group: bpy.props.IntProperty(name="Group", default=0, min=0)
-    color: bpy.props.FloatVectorProperty(
-        name="Color",
-        subtype="COLOR",
-        size=4,
-        min=0.0,
-        max=1.0,
-        default=(1.0, 1.0, 1.0, 1.0),
+            if not (
+                np.isfinite(view_sx.x) and np.isfinite(view_sx.y)
+                and np.isfinite(view_sy.x) and np.isfinite(view_sy.y)
+            ):
+                break
+
+            jac = np.array([
+                [(float(view_sx.x) - float(cur_view.x)) / shift_eps, (float(view_sy.x) - float(cur_view.x)) / shift_eps],
+                [(float(view_sx.y) - float(cur_view.y)) / shift_eps, (float(view_sy.y) - float(cur_view.y)) / shift_eps],
+            ])
+
+            if not np.all(np.isfinite(jac)):
+                break
+
+            try:
+                if np.linalg.cond(jac) > 1e4:
+                    break
+            except Exception:
+                break
+
+            delta, *_ = np.linalg.lstsq(jac, np.array([err_u, err_v]), rcond=None)
+            if not np.all(np.isfinite(delta)):
+                break
+
+            dsx = float(np.clip(delta[0] * 0.7, -max_shift_step, max_shift_step))
+            dsy = float(np.clip(delta[1] * 0.7, -max_shift_step, max_shift_step))
+
+            cam.data.shift_x = base_shift_x + dsx
+            cam.data.shift_y = base_shift_y + dsy
+            self._update_view_layer()
+
+            new_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+            if not (np.isfinite(new_view.x) and np.isfinite(new_view.y)):
+                cam.data.shift_x = base_shift_x
+                cam.data.shift_y = base_shift_y
+                self._update_view_layer()
+                break
+
+            new_err_u = target_uv[0] - float(new_view.x)
+            new_err_v = target_uv[1] - float(new_view.y)
+            new_err_px = np.hypot(new_err_u * pixel_res_x, new_err_v * pixel_res_y)
+            if (not np.isfinite(new_err_px)) or new_err_px >= err_px:
+                cam.data.shift_x = base_shift_x
+                cam.data.shift_y = base_shift_y
+                self._update_view_layer()
+                break
+
+    def get_focal_length_mm(self):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if cam is None:
+            return 50.0
+        return float(cam.data.lens)
+
+    def set_focal_length_mm(self, value):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if scene is None or cam is None:
+            return
+
+        new_lens = float(max(value, 1.0))
+        if not np.isfinite(new_lens):
+            return
+
+        old_lens = float(cam.data.lens)
+        if abs(new_lens - old_lens) < 1e-6:
+            return
+
+        target_uv = None
+        cursor_location = scene.cursor.location.copy()
+        try:
+            cursor_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
+            if np.isfinite(cursor_view.x) and np.isfinite(cursor_view.y):
+                target_uv = (float(cursor_view.x), float(cursor_view.y))
+        except Exception:
+            target_uv = None
+
+        context = bpy.context
+        view_state = None
+        if getattr(context, "scene", None) == scene:
+            view_state = utils.capture_camera_view_state(context)
+
+        cam.data.lens = new_lens
+        self._update_view_layer()
+
+        if target_uv is not None:
+            self._compensate_shift_for_cursor_uv(scene, cam, target_uv)
+
+        if view_state is not None and getattr(context, "scene", None) == scene:
+            utils.restore_camera_view_state(view_state)
+
+    def update_rotation(self, context):
+        import math
+        import mathutils
+
+        scene = getattr(self, "id_data", None)
+        solve_context = _context_for_scene(scene, context)
+        if solve_context is None:
+            return
+
+        cam = scene.camera
+        if not cam:
+            return
+
+        pivot = scene.cursor.location.copy()
+        view_state = utils.capture_camera_view_state(solve_context)
+
+        delta_rot = self.world_rotation - self.last_world_rotation
+        self.last_world_rotation = self.world_rotation
+
+        if abs(delta_rot) > 1e-6:
+            rot_mat = mathutils.Matrix.Rotation(delta_rot, 4, 'Z')
+            cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, rot_mat, pivot)
+
+        if self.flip_z_axis != self.last_flip_z:
+            self.last_flip_z = self.flip_z_axis
+            flip_mat = mathutils.Matrix.Rotation(math.pi, 4, 'X')
+            cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, flip_mat, pivot)
+
+        solve_context.view_layer.update()
+        utils.restore_camera_view_state(view_state)
+
+    def update_horizon(self, context):
+        if is_horizon_updates_suppressed():
+            return
+
+        scene = getattr(self, "id_data", None)
+        if scene is None or scene.camera is None:
+            return
+
+        cmp_data = getattr(scene, "cmp_data", None)
+        if cmp_data is None or len(cmp_data.lines) < 2:
+            return
+
+        solve_context = _context_for_scene(scene, context)
+        if solve_context is not None:
+            _solve_horizon_from_context(solve_context)
+
+    focal_length_mm: bpy.props.FloatProperty(
+        name="Focal Length (mm)",
+        description="Camera focal length in millimeters",
+        min=1.0,
+        max=10000.0,
+        get=get_focal_length_mm,
+        set=set_focal_length_mm,
+    )
+
+    world_rotation: bpy.props.FloatProperty(
+        name="3D Cursor Rotation",
+        description="Rotate camera around 3D cursor",
+        default=0.0,
+        min=-3.1415926,
+        max=3.1415926,
+        subtype='ANGLE',
+        unit='ROTATION',
+        update=update_rotation
+    )
+
+    flip_z_axis: bpy.props.BoolProperty(
+        name="Flip Z Axis",
+        description="Flip world Z axis direction around 3D cursor (rotate 180 degrees around X axis)",
+        default=False,
+        update=update_rotation
+    )
+
+    horizon_enabled: bpy.props.BoolProperty(
+        name="Enable Horizon",
+        description="Enable horizon constraint from X/Y vanishing points",
+        default=True,
+        update=update_horizon
+    )
+
+    horizon_offset_px: bpy.props.FloatProperty(
+        name="Horizon Offset",
+        description="Move horizon up/down in pixel space",
+        default=0.0,
+        soft_min=-2000.0,
+        soft_max=2000.0,
+        update=update_horizon
     )
 
 
-class RA_ColorPaletteGroup(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Name", default="Group")
 
 
-class WittyMingColorPalettePreferences(bpy.types.AddonPreferences):
-    bl_idname = __package__ or __name__.partition(".")[0]
+def register():
+    reset_horizon_update_state()
+    utils.register_class_safe(CMP_Line)
+    utils.register_class_safe(CMP_SceneProperties)
+    bpy.types.Scene.cmp_data = bpy.props.PointerProperty(type=CMP_SceneProperties)
 
-    palette_data: bpy.props.StringProperty(default="", options={"HIDDEN"})
 
-    def draw(self, context):
-        self.layout.label(text=iface_("Color palette records are stored automatically."))
+def unregister():
+    reset_horizon_update_state()
+
+    if hasattr(bpy.types.Scene, "cmp_data"):
+        del bpy.types.Scene.cmp_data
+
+    utils.unregister_class_safe(CMP_SceneProperties)
+    utils.unregister_class_safe(CMP_Line)

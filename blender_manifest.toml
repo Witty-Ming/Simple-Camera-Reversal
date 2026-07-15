@@ -1,19 +1,12 @@
 schema_version = "1.0.0"
-id = "wittyming_color_palette"
-name = "Color Palette"
-version = "1.2.1"
-tagline = "Record and drag material node colors in the Shader Editor"
+blender_version_min = "4.2.0"
+version = "1.1.3"
+id = "simple_camera_match"
+name = "Simple Camera Match"
+tagline = "Simple Camera Match - Blender插件"
+license = ["SPDX:GPL-3.0-or-later"]
 maintainer = "WittyMing"
 type = "add-on"
 website = "https://space.bilibili.com/263206115"
-tags = ["Node", "User Interface"]
-blender_version_min = "4.2.0"
-license = ["SPDX:GPL-3.0-or-later"]
-copyright = ["2026 WittyMing"]
-
-[build]
-paths_exclude_pattern = [
-  "__pycache__/",
-  ".*",
-  "*.zip",
-]
+copyright = ["WittyMing"]
+tags = ["Object","3D View","Scene"]

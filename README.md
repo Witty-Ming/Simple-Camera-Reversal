@@ -22,8 +22,8 @@
 
 #### 🎨 基础绘制操作：
 - **画线**：在视口空白处 `左键点击并拖动`，即可拉出一条透视参考线。
-- **改线**：把鼠标悬停在已绘制线段的端点上并 `左键拖拽` 即可重新修改端点位置。（悬停在线段中间圆点上点击则可以激活该线段）
-- **删线**：将鼠标悬停到某条线的端点上使其高亮，按下键盘 **`X`** 键即可删除这条线。
+- **改线**：先点击线段中点激活该线段，再用左键拖拽端点修改位置。
+- **删线**：先点击线段中点进入编辑状态，再按下键盘 **`X`** 键删除当前线段。
 - **退出**：按下键盘 **`Esc`** 或是单击鼠标 `右键` 随时退出绘制模式。
 
 #### ⌨️ 切换维度轴向 (非常重要)：
@@ -49,9 +49,9 @@
 在绘制面板的下方，你能看到一个 `Horizon Constraint`（地平线约束）模块。
 当地平线被开启后，插件会根据你画出的 X 轴、Y 轴自动推测并展示出一条蓝色的天际线。
 
-👉 **拖拽地平线把手**： 
+👉 **拖拽地平线把手**（需要保持绘制模式）： 
 1. 观察视口，在地平线的中央你会看到一个稍大一点的 **菱形手柄**。
-2. 即使你不处于绘制模式，只需将鼠标按住该手柄**上下拖动**，插件就能强行扭转覆盖相机的俯仰角 (Pitch)。利用这个手柄可以从视觉上最直观地找回照片里的相机镜头倾斜感。
+2. 在绘制模式中，将鼠标按住该手柄**上下拖动**，插件就能强行扭转覆盖相机的俯仰角 (Pitch)。退出绘制模式后，参考线和地平线叠加层会被关闭。
 3. **注意：** 拖拽手柄是一种由你主观引入的“强制偏差叠加”。因此，**每当你之后再度尝试去改动或绘制核心的透视线段时，之前手动拖拉产生的地平线偏移量将会被立刻重置清零**。保证最严谨的数学解算永远是以透视线为尊。
 
 
@@ -86,8 +86,8 @@ Click the prominent **Draw Reference Line** button in the `CameraMatch` sidebar 
 
 #### 🎨 Basic Drawing Operations:
 - **Draw Line**: `Left Click and Drag` in an empty area of the viewport to create a perspective reference line.
-- **Edit Line**: Hover the mouse over an endpoint of a drawn line and `Left Click and Drag` to modify its position. (Clicking the middle dot of a line makes it active).
-- **Delete Line**: Hover over an endpoint of a line to highlight it, and press **`X`** to delete that line.
+- **Edit Line**: Click the middle dot to activate a line, then left-click and drag one of its endpoints.
+- **Delete Line**: Click the middle dot of a line to enter edit mode, then press **`X`** to delete the active line.
 - **Exit**: Press **`Esc`** or `Right Click` to exit drawing mode at any time.
 
 #### ⌨️ Switch Dimension Axes (Crucial):
@@ -114,9 +114,9 @@ Click the prominent **Draw Reference Line** button in the `CameraMatch` sidebar 
 Below the drawing panel, you will find the `Horizon Constraint` module.
 When enabled, the plugin automatically infers and displays a blue horizon line based on your drawn X and Y axes.
 
-👉 **Drag the Horizon Handle**:
+👉 **Drag the Horizon Handle** (drawing mode required):
 1. Look at the viewport. You will see a slightly larger **diamond-shaped handle** in the center of the horizon.
-2. Even when not in drawing mode, you can simply click and **drag this handle up or down** to forcefully adjust the camera's Pitch. This handle allows you to visually recover the camera tilt from the reference photo.
+2. While drawing mode is active, click and **drag this handle up or down** to forcefully adjust the camera's Pitch. The guide overlay is removed when drawing mode ends.
 3. **Note:** Dragging the handle introduces an intentional, manual "offset variation". Therefore, **whenever you subsequently attempt to modify or draw core perspective lines, any previously dragged manual horizon offset will be immediately reset to zero**. This ensures that rigorous mathematical solving is always prioritized based on your perspective lines.
 
 ## 🤖 Automation Details

@@ -13,11 +13,16 @@ class CMP_PT_MainPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        is_perspective = bool(
+            scene.camera
+            and getattr(scene.camera.data, "type", None) == 'PERSP'
+        )
 
         # 1. 绘制工具
         layout.label(text="Step 1: Drawing", icon='GREASEPENCIL')
         row = layout.row()
         row.scale_y = 1.5
+        row.enabled = is_perspective
         row.operator("cmp.draw_line", text="Start Drawing (Brush)", icon='GREASEPENCIL')
 
         layout.separator()
@@ -26,6 +31,7 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         layout.label(text="Step 2: Solve", icon='CHECKMARK')
         col = layout.column(align=True)
         col.scale_y = 1.3
+        col.enabled = is_perspective
         col.operator("cmp.match_camera", text="Match Camera (Solve)", icon='CAMERA_DATA')
 
         col.separator()
@@ -37,11 +43,9 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         layout.separator()
 
         horizon_box = layout.box()
+        horizon_box.enabled = is_perspective
         horizon_box.label(text="Horizon Constraint", icon='HIDE_OFF')
         horizon_box.prop(scene.cmp_data, "horizon_enabled", text="Enable Horizon")
-
-        if scene.cmp_data.horizon_enabled:
-            horizon_col = horizon_box.column(align=True)
 
         layout.separator()
 
@@ -60,13 +64,18 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         layout.separator()
 
         # 4. 信息
-        if scene.camera:
+        if is_perspective:
             col = layout.column(align=True)
             col.prop(scene.cmp_data, "focal_length_mm", text="Focal Length (mm)")
             col.prop(scene.camera.data, "sensor_width", text="Sensor (mm)")
+        elif scene.camera:
+            warning = layout.row()
+            warning.alert = True
+            warning.label(text="Only perspective cameras are supported", icon='ERROR')
         else:
-            layout.alert = True
-            layout.label(text="Warning: No Active Camera!", icon='ERROR')
+            warning = layout.row()
+            warning.alert = True
+            warning.label(text="Warning: No Active Camera!", icon='ERROR')
 
 
 def register():

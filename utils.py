@@ -671,7 +671,18 @@ def solve_weighted_svd(lines, weights):
     weights: (N,) 数组，表示线条重要性 (例如长度)
     返回: (u, v)
     """
-    if len(lines) < 2: return None
+    if len(lines) < 2:
+        return None
+
+    lines = np.asarray(lines, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    # 2x3 矩阵的薄型 SVD 不包含齐次零空间，直接用叉乘求两条线的交点。
+    if len(lines) == 2:
+        point_h = np.cross(lines[0], lines[1])
+        if not np.all(np.isfinite(point_h)) or abs(point_h[2]) < 1e-8:
+            return None
+        return point_h[:2] / point_h[2]
     
     # 按 sqrt(weights) 缩放线条，使 SVD 最小化加权平方误差
     # W * (L . p) = 0
@@ -681,14 +692,14 @@ def solve_weighted_svd(lines, weights):
     try:
         # 对 A (Nx3) 进行 SVD
         # 我们寻找向量 v (3x1) 使得 |A v|^2 最小化，约束条件 |v|=1
-        u, s, vh = np.linalg.svd(weighted_lines, full_matrices=False)
+        _u, _s, vh = np.linalg.svd(weighted_lines, full_matrices=False)
         v = vh[-1] # 解是对应于最小奇异值的右奇异向量
         
         if abs(v[2]) < 1e-8: # 无穷远点
             return None
             
         return v[:2] / v[2]
-    except:
+    except Exception:
         return None
 
 def solve_vanishing_point_2d(lines, weights=None, image_diag=2000.0):
@@ -1098,17 +1109,30 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix):
         # 或者对线条使用 SVD 寻找最佳法线？
         # 让我们只是为了稳健性平均法线
         axis_normals = []
+        reference_normal = None
         for line in lines_data[axis]:
             a, b, c, length = line
             # 法线: (a, b, -c/f_pixels)
-            n = np.array([a, b, -c / f_pixels])
-            n = n / np.linalg.norm(n)
+            n = np.array([a, b, -c / f_pixels], dtype=float)
+            n_length = np.linalg.norm(n)
+            if not np.isfinite(n_length) or n_length <= 1e-8:
+                continue
+            n = n / n_length
+
+            # 交换线段起终点会让整条直线方程反号，但几何约束不应改变。
+            if reference_normal is None:
+                reference_normal = n.copy()
+            elif np.dot(n, reference_normal) < 0.0:
+                n = -n
+
             # 按长度加权
             axis_normals.append(n * length)
             
         if axis_normals:
             sum_n = np.sum(axis_normals, axis=0)
-            normals[axis] = sum_n / np.linalg.norm(sum_n)
+            sum_length = np.linalg.norm(sum_n)
+            if np.isfinite(sum_length) and sum_length > 1e-8:
+                normals[axis] = sum_n / sum_length
             
     if len(normals) < 2:
         return None # 需要至少 2 个轴

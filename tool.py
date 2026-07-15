@@ -39,10 +39,15 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             self.report({'WARNING'}, "Please add a camera first")
             return {'CANCELLED'}
 
+        if getattr(context.scene.camera.data, "type", None) != 'PERSP':
+            self.report({'WARNING'}, "Only perspective cameras are supported")
+            return {'CANCELLED'}
+
         if not utils.is_camera_view(context):
             self.report({'WARNING'}, "Please switch to Camera View first")
             return {'CANCELLED'}
 
+        self._cleanup_done = False
         self.state = self.STATE_IDLE
         self.current_axis = 'X'
         self.last_error = ""
@@ -177,7 +182,19 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.trigger_solve(context)
 
     def modal(self, context, event):
-        context.area.tag_redraw()
+        scene = getattr(context, "scene", None)
+        area = getattr(context, "area", None)
+        cmp_data = getattr(scene, "cmp_data", None) if scene is not None else None
+        if area is None or cmp_data is None:
+            self.quit(context)
+            return {'CANCELLED'}
+
+        cam = scene.camera
+        if cam is None or getattr(cam.data, "type", None) != 'PERSP':
+            self.quit(context)
+            return {'CANCELLED'}
+
+        area.tag_redraw()
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             self.quit(context)
@@ -186,8 +203,6 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
             return {'PASS_THROUGH'}
 
-        cmp_data = context.scene.cmp_data
-        
         # 实现在绘制模式下切换相机时，自动进行数据清理和重绑，彻底告别报错弹窗
         if cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
             self.clear_all_lines(context, push_history=False, run_solve=False)
@@ -564,6 +579,21 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             'axis': str(line.axis),
         }
 
+    def camera_to_snapshot(self, camera):
+        if camera is None or getattr(camera, "data", None) is None:
+            return None
+
+        return {
+            'name': str(camera.name),
+            'matrix_world': tuple(
+                tuple(float(value) for value in row)
+                for row in camera.matrix_world
+            ),
+            'lens': float(camera.data.lens),
+            'shift_x': float(camera.data.shift_x),
+            'shift_y': float(camera.data.shift_y),
+        }
+
     def state_to_snapshot(self, context):
         cmp_data = context.scene.cmp_data
         lines_data = [self.line_to_dict(line) for line in cmp_data.lines]
@@ -571,8 +601,13 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             'lines': lines_data,
             'active_index': int(cmp_data.active_index),
             'lines_camera_name': cmp_data.lines_camera.name if cmp_data.lines_camera is not None else None,
+            'camera': self.camera_to_snapshot(context.scene.camera),
             'horizon_enabled': bool(cmp_data.horizon_enabled),
             'horizon_offset_px': float(cmp_data.horizon_offset_px),
+            'world_rotation': float(cmp_data.world_rotation),
+            'last_world_rotation': float(cmp_data.last_world_rotation),
+            'flip_z_axis': bool(cmp_data.flip_z_axis),
+            'last_flip_z': bool(cmp_data.last_flip_z),
         }
 
     def restore_snapshot(self, context, snapshot):
@@ -580,6 +615,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             return
 
         cmp_data = context.scene.cmp_data
+        view_state = utils.capture_camera_view_state(context)
         properties.suppress_horizon_updates()
         try:
             cmp_data.lines.clear()
@@ -600,8 +636,33 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
             cmp_data.horizon_enabled = bool(snapshot.get('horizon_enabled', cmp_data.horizon_enabled))
             cmp_data.horizon_offset_px = float(snapshot.get('horizon_offset_px', cmp_data.horizon_offset_px))
+
+            saved_world_rotation = float(snapshot.get('world_rotation', cmp_data.world_rotation))
+            saved_last_world_rotation = float(snapshot.get('last_world_rotation', saved_world_rotation))
+            saved_flip_z = bool(snapshot.get('flip_z_axis', cmp_data.flip_z_axis))
+            saved_last_flip_z = bool(snapshot.get('last_flip_z', saved_flip_z))
+
+            # 先让更新回调看到零增量，避免恢复滑块时再次旋转相机。
+            cmp_data.last_world_rotation = saved_world_rotation
+            cmp_data.world_rotation = saved_world_rotation
+            cmp_data.last_flip_z = saved_flip_z
+            cmp_data.flip_z_axis = saved_flip_z
+            cmp_data.last_world_rotation = saved_last_world_rotation
+            cmp_data.last_flip_z = saved_last_flip_z
+
+            camera_state = snapshot.get('camera')
+            camera = context.scene.camera
+            if camera_state and camera is not None and camera.name == camera_state.get('name'):
+                matrix_world = camera_state.get('matrix_world')
+                if matrix_world is not None:
+                    camera.matrix_world = mathutils.Matrix(matrix_world)
+                camera.data.lens = float(camera_state.get('lens', camera.data.lens))
+                camera.data.shift_x = float(camera_state.get('shift_x', camera.data.shift_x))
+                camera.data.shift_y = float(camera_state.get('shift_y', camera.data.shift_y))
+                context.view_layer.update()
         finally:
             properties.resume_horizon_updates()
+            utils.restore_camera_view_state(view_state)
 
     def push_history(self, context):
         snapshot = self.state_to_snapshot(context)
@@ -617,7 +678,8 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.redo_stack.append(current)
         snapshot = self.undo_stack.pop()
         self.restore_snapshot(context, snapshot)
-        self.trigger_solve(context, force=True)
+        self.last_error = ""
+        self.update_header(context)
 
     def redo(self, context):
         if not self.redo_stack:
@@ -626,7 +688,8 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.undo_stack.append(current)
         snapshot = self.redo_stack.pop()
         self.restore_snapshot(context, snapshot)
-        self.trigger_solve(context, force=True)
+        self.last_error = ""
+        self.update_header(context)
 
     def begin_drag_history(self, context, _idx=-1):
         if self.drag_history is None:
@@ -741,19 +804,38 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             pass
 
     def quit(self, context):
-        self.end_horizon_drag_updates()
+        if getattr(self, "_cleanup_done", False):
+            return
+        self._cleanup_done = True
 
-        context.scene.cmp_data.is_drawing_mode = False
-        context.scene.cmp_data.is_creating_line = False
+        try:
+            self.end_horizon_drag_updates()
+        except Exception:
+            properties.reset_horizon_update_state()
 
-        context.area.header_text_set(None)
-        context.window.cursor_modal_restore()
+        scene = getattr(context, "scene", None)
+        cmp_data = getattr(scene, "cmp_data", None) if scene is not None else None
+        if cmp_data is not None:
+            cmp_data.is_drawing_mode = False
+            cmp_data.is_creating_line = False
+            cmp_data.active_index = -1
+
+        area = getattr(context, "area", None)
+        if area is not None:
+            try:
+                area.header_text_set(None)
+                area.tag_redraw()
+            except Exception:
+                pass
 
         try:
             from . import gpu_draw
             gpu_draw.unregister()
         except Exception:
             pass
+
+    def cancel(self, context):
+        self.quit(context)
 
     def screen_to_norm(self, context, x, y):
         if not utils.is_camera_view(context):
