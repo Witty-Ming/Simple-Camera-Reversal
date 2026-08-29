@@ -358,7 +358,11 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 self.state = self.STATE_IDLE
                 self.horizon_drag_shift_state = None
                 self.end_horizon_drag_updates()
-                self.trigger_solve(context, force=True)
+                # 修复：拖拽松手后保留预览姿态，不再强制重解算。
+                # 拖拽期间相机已经被 apply_horizon_drag_camera_preview 直接旋转到位；
+                # 若再触发 solve_camera_core，解算会以线条为尊重新求解，
+                # 把刚拖出来的俯仰覆盖（地平线偏移）大幅回退。
+                # （原实现: self.trigger_solve(context, force=True)）
 
         return {'RUNNING_MODAL'}
 
@@ -462,6 +466,20 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             )
             self.horizon_drag_start_mouse_render = mouse_render
             self.horizon_drag_start_offset = float(cmp_data.horizon_offset_px)
+            # 修复：切换微调 (Shift) 时必须同步重锚相机姿态，否则
+            # apply_horizon_drag_camera_preview 会从最初的 start_matrix 计算，
+            # 导致相机瞬间跳回拖拽前的姿态、拖拽量丢失。
+            drag_cam = context.scene.camera
+            if drag_cam is not None:
+                self.horizon_drag_start_camera_matrix = drag_cam.matrix_world.copy()
+                self.horizon_drag_start_f_pixels = utils.get_effective_f_pixels(
+                    drag_cam.data.lens,
+                    drag_cam.data.sensor_width,
+                    drag_cam.data.sensor_height,
+                    drag_cam.data.sensor_fit,
+                    pixel_res_x,
+                    pixel_res_y,
+                )
 
         render = context.scene.render
         pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)

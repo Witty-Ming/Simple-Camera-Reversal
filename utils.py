@@ -327,12 +327,6 @@ def solve_vanishing_points(lines_data, pixel_res_x, pixel_res_y):
     return vp_data, axis_weights
 
 
-def rotate_vector_2d(vec, angle_rad):
-    c = math.cos(angle_rad)
-    s = math.sin(angle_rad)
-    return np.array([vec[0] * c - vec[1] * s, vec[0] * s + vec[1] * c], dtype=float)
-
-
 def compute_adjusted_horizon(vp_data, offset_px=0.0):
     has_x = 'X' in vp_data
     has_y = 'Y' in vp_data
@@ -599,20 +593,6 @@ def apply_horizon_constraint_to_vps(vp_data, enabled=False, offset_px=0.0):
     return adjusted, horizon
 
 
-def distance_point_to_segment_2d(point, start, end):
-    point = np.array(point, dtype=float)
-    start = np.array(start, dtype=float)
-    end = np.array(end, dtype=float)
-    segment = end - start
-    segment_length_sq = np.dot(segment, segment)
-    if segment_length_sq <= 1e-12:
-        return np.linalg.norm(point - start)
-    t = np.dot(point - start, segment) / segment_length_sq
-    t = np.clip(t, 0.0, 1.0)
-    closest = start + t * segment
-    return np.linalg.norm(point - closest)
-
-
 def rotate_matrix_around_point(matrix_world, rotation_matrix, pivot):
     return (
         mathutils.Matrix.Translation(pivot)
@@ -769,13 +749,46 @@ def orthonormalize_matrix(R):
        R_ortho = U @ Vt
     return R_ortho
 
-def calculate_focal_length(vp1, vp2):
-    u1, v1 = vp1
-    u2, v2 = vp2
-    dot = u1*u2 + v1*v2
-    if dot < 0: return np.sqrt(-dot)
-    return None
 
+def select_axis_signs(vx, vy, vz, current_rot_matrix=None):
+    """
+    消除"世界轴在相机坐标系下的方向向量"的符号歧义。
+
+    消失点反演得到的轴向 (vx, vy, vz) 各自存在 ± 二义性（平行线本身无法
+    区分轴线正反方向，尤其是轴线指向相机后方时反演结果必然取反）。这里
+    枚举所有 det=+1 的符号组合，再借助当前相机旋转选择与现有机位最接近的
+    组合，从而避免"世界 Z 朝上"一刀切启发式把俯视/偏航相机错误扭转。
+
+    返回: 世界->相机 旋转矩阵 (numpy 3x3)
+    """
+    base = np.column_stack((vx, vy, vz))
+    d0 = float(np.linalg.det(base))
+    if not np.isfinite(d0) or abs(d0) < 1e-12:
+        # 退化帧，直接正交化
+        return orthonormalize_matrix(base)
+    sign = 1.0 if d0 > 0 else -1.0
+
+    combos = []
+    for sx in (1.0, -1.0):
+        for sy in (1.0, -1.0):
+            for sz in (1.0, -1.0):
+                if sx * sy * sz != sign:
+                    continue
+                combos.append(orthonormalize_matrix(
+                    np.column_stack((sx * vx, sy * vy, sz * vz))))
+
+    if current_rot_matrix is not None:
+        R_seed = np.array(current_rot_matrix).T  # Cam->World -> World->Cam
+        scored = [(float(np.sum(M * R_seed)), M) for M in combos]
+        best_score = max(s for s, _ in scored)
+        # 得分接近（例如对称机位）时优先选择世界 Z 朝上的组合
+        zup = [M for s, M in scored if abs(s - best_score) < 1e-6 and M[1, 2] > 0]
+        if zup:
+            return zup[0]
+        return max(scored, key=lambda t: t[0])[1]
+
+    zup = [M for M in combos if M[1, 2] > 0]
+    return zup[0] if zup else combos[0]
 
 
 def get_effective_f_pixels(f_mm, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height):
@@ -825,10 +838,11 @@ def get_effective_f_mm_from_pixels(f_pixels, sensor_width_mm, sensor_height_mm, 
 
 
 
-def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None, anchor_location=None, anchor_screen_offset=None):
+def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height, current_dist, default_f_mm=50.0, axis_weights=None, anchor_location=None, anchor_screen_offset=None, current_rot_matrix=None):
     """
     vp_data: {'X':(u,v), ...} 以中心像素为单位
     axis_weights: {'X': count, ...} 各轴的线段数量权重
+    current_rot_matrix: 当前相机旋转 (Cam->World, 3x3)，用于消除轴线方向符号歧义
     返回 f_mm, rot_matrix, shift_x, shift_y, new_location
     
     增强版：添加焦距合理性验证和置信度评估。
@@ -1046,18 +1060,10 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
         return None, None, 0, 0, None
         
     rx, ry, rz = current_cols['X'], current_cols['Y'], current_cols['Z']
-    
-    # 强制 Z 轴朝上检查
-    if rz[1] < 0:
-        ry = -ry
-        rz = -rz
-        current_cols['Y'] = ry
-        current_cols['Z'] = rz
-        
-    # 初始正交化
-    R_raw = np.column_stack((rx, ry, rz))
-    R_ortho = orthonormalize_matrix(R_raw)
-    rot_matrix = mathutils.Matrix(R_ortho.T)
+    # 符号消歧：枚举 det=+1 的符号组合，借助当前相机旋转选择最接近的组合，
+    # 替代原来"世界 Z 朝上则翻转"的错误启发式（俯视相机会被错误扭转 2×pitch）。
+    R_w2c = select_axis_signs(rx, ry, rz, current_rot_matrix=current_rot_matrix)
+    rot_matrix = mathutils.Matrix(R_w2c.T)
     
     # 5. 位置 (轨道)
     target_px = 0.0 - principal_point[0]
@@ -1087,13 +1093,14 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
 
     return f_mm_final, rot_matrix, shift_x, shift_y, loc_orbit
 
-def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix):
+def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix, iterations=20):
     """
     使用单线（平面）和固定焦距求解旋转。
     lines_data: {'X': [[a,b,c,len],...], 'Y':...}
     f_pixels: 当前像素焦距
     current_rot_matrix: 3x3 mathutils 矩阵 (世界到相机? 不，相机方向)
                         Blender 相机矩阵: Col 0=右, Col 1=上, Col 2=后.
+    iterations: 迭代投影的迭代次数
     返回: rot_matrix (3x3)
     """
     
@@ -1141,11 +1148,12 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix):
     # 我们希望 R = [rx, ry, rz] 使得 rx 垂直 Nx, ry 垂直 Ny, rz 垂直 Nz
     # 使用当前的 R_world_to_cam 初始化
     R = np.array(current_rot_matrix).T # current_rot_matrix 是 Cam->World。转置 -> World->Cam。
+    R_seed = R.copy()
     # 确保正交仅防万一
     R = orthonormalize_matrix(R) 
     
     # 迭代投影
-    for i in range(20):
+    for i in range(iterations):
         # 1. 投影列到平面
         u, v, w = R[:, 0], R[:, 1], R[:, 2]
         
@@ -1168,21 +1176,15 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix):
         R_new = np.column_stack((u, v, w))
         R = orthonormalize_matrix(R_new)
         
-    # 3. 检查 Z 轴朝上 (如果需要则翻转)
-    # R 第 2 列是相机空间中的世界 Z。
-    # 相机 Y 是上。所以 R[1, 2] 应该是正的？
-    # 实际上，通过水平观察，世界 Z 在图像中应该是“向上”的。
-    # 如果 R[1, 2] < 0，Z 是指向下的。
-    if R[1, 2] < 0:
-        # 翻转世界的 Y 和 Z 轴
-        # 交换第 1 和 第 2 列？不，那会改变手性。
-        # 绕 X 旋转 180？
-        # 翻转 Y 和 Z 列 -> 改变手性。
-        # 翻转 Y 和 Z 列并取反一个？
-        # 让我们直接取反 Y 和 Z 列。
-        R[:, 1] = -R[:, 1]
-        R[:, 2] = -R[:, 2]
-        
+    # 3. 离散二义性消除：迭代投影从种子出发，收敛解与种子同向；
+    #    仅在"翻转世界 Y/Z（绕视轴转180°）"与收敛解之间选择更接近种子的那个，
+    #    避免无脑"世界 Z 朝上"翻转把俯视相机的俯仰错误扭转。
+    R_flip = R.copy()
+    R_flip[:, 1] = -R_flip[:, 1]
+    R_flip[:, 2] = -R_flip[:, 2]
+    if float(np.sum(R_flip * R_seed)) > float(np.sum(R * R_seed)):
+        R = R_flip
+
     # 作为 Blender 矩阵返回 (Cam->World)
     return mathutils.Matrix(R.T)
 
@@ -1333,43 +1335,56 @@ def refine_focal_length_for_constrained_rotation(
         }
 
     current_f = max(float(current_f_mm), 1e-6)
-    coarse_factors = np.linspace(0.35, 2.3, 24)
-    fine_factors = np.linspace(0.80, 1.25, 19)
-    factors = sorted({float(v) for v in np.concatenate((coarse_factors, fine_factors, np.array([1.0])))})
+    # 性能：内部扫描使用较少的迭代投影次数（最终解仍用 20 次）。
+    scan_iterations = 12
 
-    candidates = []
-    for factor in factors:
-        f_candidate = float(np.clip(current_f * factor, 8.0, 2000.0))
-        if not any(abs(f_candidate - prev) < 1e-6 for prev in candidates):
-            candidates.append(f_candidate)
+    def scan_factors(factors):
+        scored = []
+        for factor in factors:
+            f_candidate = float(np.clip(current_f * factor, 8.0, 2000.0))
+            if any(abs(f_candidate - prev) < 1e-6 for prev, *_ in scored):
+                continue
 
-    if all(abs(candidate - current_f) > 1e-6 for candidate in candidates):
-        candidates.append(current_f)
+            f_pixels = get_effective_f_pixels(
+                f_candidate,
+                sensor_width_mm,
+                sensor_height_mm,
+                sensor_fit,
+                pixel_width,
+                pixel_height,
+            )
+            if not np.isfinite(f_pixels) or f_pixels <= 1e-8:
+                continue
 
-    scored = []
-    for f_candidate in candidates:
-        f_pixels = get_effective_f_pixels(
-            f_candidate,
-            sensor_width_mm,
-            sensor_height_mm,
-            sensor_fit,
-            pixel_width,
-            pixel_height,
-        )
-        if not np.isfinite(f_pixels) or f_pixels <= 1e-8:
-            continue
+            rot_candidate = solve_camera_rotation_constrained(
+                lines_data, f_pixels, current_rot_matrix, iterations=scan_iterations)
+            if rot_candidate is None:
+                continue
 
-        rot_candidate = solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix)
-        if rot_candidate is None:
-            continue
+            residual = compute_rotation_constraint_residual(lines_data, rot_candidate, f_pixels)
+            if not np.isfinite(residual):
+                continue
 
-        residual = compute_rotation_constraint_residual(lines_data, rot_candidate, f_pixels)
-        if not np.isfinite(residual):
-            continue
+            proximity_penalty = 0.008 * abs(math.log(max(f_candidate, 1e-6) / current_f))
+            score = residual + proximity_penalty
+            scored.append((score, residual, f_candidate, rot_candidate))
+        return scored
 
-        proximity_penalty = 0.008 * abs(math.log(max(f_candidate, 1e-6) / current_f))
-        score = residual + proximity_penalty
-        scored.append((score, residual, f_candidate, rot_candidate))
+    # 阶段一: 粗扫定位最优焦距的大致区间
+    coarse_factors = np.linspace(0.35, 2.3, 12)
+    scored = scan_factors(coarse_factors)
+
+    # 始终把当前焦距纳入候选（作为残差比较的基线）
+    if not any(abs(item[2] - current_f) < 1e-6 for item in scored):
+        f_pixels0 = get_effective_f_pixels(
+            current_f, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height)
+        if np.isfinite(f_pixels0) and f_pixels0 > 1e-8:
+            rot0 = solve_camera_rotation_constrained(
+                lines_data, f_pixels0, current_rot_matrix, iterations=scan_iterations)
+            if rot0 is not None:
+                residual0 = compute_rotation_constraint_residual(lines_data, rot0, f_pixels0)
+                if np.isfinite(residual0):
+                    scored.append((residual0, residual0, current_f, rot0))
 
     if not scored:
         return {
@@ -1380,6 +1395,17 @@ def refine_focal_length_for_constrained_rotation(
         }
 
     scored.sort(key=lambda item: item[0])
+    best = scored[0]
+
+    # 阶段二: 在粗扫最优附近细扫
+    f_best = float(best[2])
+    lo = max(8.0, f_best * 0.88)
+    hi = min(2000.0, f_best * 1.12)
+    if hi > lo:
+        fine_factors = np.linspace(lo / current_f, hi / current_f, 9)
+        scored.extend(scan_factors(fine_factors))
+        scored.sort(key=lambda item: item[0])
+
     _best_score, best_residual, best_f_mm, _best_rot = scored[0]
 
     baseline_items = [item for item in scored if abs(item[2] - current_f) < 1e-6]

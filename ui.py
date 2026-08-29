@@ -13,6 +13,18 @@ class CMP_PT_MainPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+
+        # 0. 背景图分辨率匹配（置于面板最上方）
+        row = layout.row()
+        row.scale_y = 1.5
+        row.operator(
+            "cmp.match_background_resolution",
+            text="Match Background Resolution",
+            icon='IMAGE_DATA',
+        )
+
+        layout.separator()
+
         is_perspective = bool(
             scene.camera
             and getattr(scene.camera.data, "type", None) == 'PERSP'

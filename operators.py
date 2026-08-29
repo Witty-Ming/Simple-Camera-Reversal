@@ -224,6 +224,7 @@ def solve_camera_core(context):
                     axis_weights=solve_axis_weights,
                     anchor_location=cursor_location,
                     anchor_screen_offset=anchor_screen_offset,
+                    current_rot_matrix=cam.matrix_world.to_3x3(),
                 )
             except Exception as e:
                 print(f"[CameraMatch] Hybrid full solve failed: {e}")
@@ -252,8 +253,15 @@ def solve_camera_core(context):
                 )
                 hybrid_residual = utils.compute_rotation_constraint_residual(lines_data, rot_matrix, hybrid_f_pixels)
                 improvement = hybrid_residual - strict_residual
+
+                # 用户手动拖拽地平线产生的偏移属于"强制俯仰覆盖"，必须优先于
+                # 基于线条的 strict 解，否则松手后俯仰会被瞬间回退（strict 解
+                # 以原始线条为尊，会把偏移带来的俯仰还原掉）。
+                horizon_override_active = abs(scene.cmp_data.horizon_offset_px) > 1e-9
+
                 improved_enough = (
-                    np.isfinite(hybrid_residual)
+                    not horizon_override_active
+                    and np.isfinite(hybrid_residual)
                     and np.isfinite(strict_residual)
                     and (
                         strict_residual <= hybrid_residual * 0.985
@@ -489,9 +497,73 @@ class CMP_OT_MatchCamera(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+class CMP_OT_MatchBackgroundResolution(bpy.types.Operator):
+    """Match render resolution to the camera background image resolution"""
+    bl_idname = "cmp.match_background_resolution"
+    bl_label = "Match Background Resolution"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _notify_no_background(self, context, msg):
+        iface_ = bpy.app.translations.pgettext_iface
+        msg = iface_(msg)
+        self.report({'WARNING'}, msg)
+        print(f"[CameraMatch] {msg}")
+
+        def draw(menu, _ctx):
+            menu.layout.label(text=msg)
+
+        # 仅在有窗口的 GUI 会话中弹窗；后台/无窗口模式调用 popup_menu 会段错误
+        if not bpy.app.background:
+            try:
+                wm = getattr(context, "window_manager", None) or bpy.context.window_manager
+                if wm is not None:
+                    wm.popup_menu(draw, title="Simple Camera Match", icon='INFO')
+            except Exception:
+                pass
+
+    def execute(self, context):
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            self.report({'ERROR'}, "No scene")
+            return {'CANCELLED'}
+
+        cam = scene.camera
+        if cam is None or getattr(cam, "data", None) is None:
+            self._notify_no_background(context, "No camera or no background image on active camera")
+            return {'CANCELLED'}
+
+        bg_image = None
+        for item in cam.data.background_images:
+            if item.image is not None:
+                bg_image = item.image
+                break
+
+        if bg_image is None:
+            self._notify_no_background(context, "No background image on active camera")
+            return {'CANCELLED'}
+
+        w, h = int(bg_image.size[0]), int(bg_image.size[1])
+        if w <= 0 or h <= 0:
+            self._notify_no_background(context, "Background image has no valid size")
+            return {'CANCELLED'}
+
+        render = scene.render
+        render.resolution_x = w
+        render.resolution_y = h
+        render.resolution_percentage = 100
+
+        iface_ = bpy.app.translations.pgettext_iface
+        msg = iface_("Render resolution set to ") + "%dx%d" % (w, h)
+        self.report({'INFO'}, msg)
+        print(f"[CameraMatch] {msg}")
+        return {'FINISHED'}
+
+
 def register():
     utils.register_class_safe(CMP_OT_MatchCamera)
+    utils.register_class_safe(CMP_OT_MatchBackgroundResolution)
 
 
 def unregister():
+    utils.unregister_class_safe(CMP_OT_MatchBackgroundResolution)
     utils.unregister_class_safe(CMP_OT_MatchCamera)
