@@ -147,3 +147,12 @@ When enabled, the plugin automatically infers and displays a blue horizon line b
 ## 🤖 Automation Details
 If you are immersed in matching lines for one camera and suddenly switch to another camera in the Outliner—**Don't worry!**
 The plugin instantly detects the viewport change and **automatically wipes all the messy history from the previous camera**. You can immediately start drawing your new camera with zero errors or interruptions!
+
+---
+
+## 📺 Video Tutorial
+
+[![Simple Camera Reversal Tutorial](https://img.youtube.com/vi/q9U0xGSFKTI/sddefault.jpg)](https://youtu.be/q9U0xGSFKTI)
+
+[Click here to watch the video guide](https://youtu.be/q9U0xGSFKTI)
+
