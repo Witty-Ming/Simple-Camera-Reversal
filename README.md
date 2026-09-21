@@ -11,6 +11,7 @@
 - **丝滑的多相机支持**：无论是切换相机还是新建相机，插件都能在后台自动实现无缝接管与数据清理。
 - **历史记录安全**：内置独立的绘制操作撤销 / 重做栈，避免与 Blender 庞大混乱的全局撤销树冲突。
 - **一键匹配背景图分辨率**：N 面板顶部的按钮可将渲染分辨率自动设置为当前相机背景图的原生分辨率。
+- **希区柯克变焦 (Dolly Zoom)**：N 面板底部的焦距滑块在改变焦距的同时让相机沿自身光轴移动，使 3D 游标所在平面的构图完全不变——主体纹丝不动，只有背景透视被压缩 / 扩张。
 
 ---
 
@@ -71,6 +72,27 @@
 
 ---
 
+## 🎬 高级功能：希区柯克变焦 (Hitchcock Zoom / Dolly Zoom)
+
+在 `CameraMatch` 侧边栏的**最下方**有一个 **Hitchcock Zoom (Dolly Zoom)** 焦距滑块：
+
+1. 先完成相机匹配（并把 3D 游标放在照片中一个明确的参考点上）。
+2. 直接拖动该滑块改变焦距 —— 插件会**同时让相机沿自身光轴前后移动**，
+   使 **3D 游标所在深度平面的构图（大小与位置）完全不变**。
+3. 效果：主体纹丝不动，只有背景的透视被压缩或扩张，也就是电影里经典的
+   "眩晕变焦"（Vertigo Effect）。
+
+**原理**：画面中深度 `d` 处的成像大小正比于 `f / d`。只要让焦距与深度按同一比例
+缩放（`d′ = d · f′/f`），该深度平面上的所有点其屏幕坐标都不变。这里用的是
+"游标深度"而非相机到游标的直线距离——游标偏离画面中心时，只有按深度缩放才能
+让构图严格不动。
+
+> **与上方 `Focal Length (mm)` 的区别**：那个滑块只单纯改焦距（内部用 shift 补偿
+> 保持游标位置），画面大小会随之变化；希区柯克变焦会真的移动相机，因此**不会破坏
+> 已经匹配好的构图**，适合在匹配完成后微调"透视强度"。
+
+---
+
 ## 🧭 数学原理补充说明
 
 - **尺度锚点 = 3D 游标**：线条只能确定方向（消失点），无法确定场景尺度。解算会保持
@@ -78,6 +100,13 @@
   放到照片中一个明确的参考点上。
 - **地平线吸附**：当 3D 游标在画面中距离地平线 8px 以内时，解算会把游标吸附到地平线
   上，保证游标始终落在画面中的地平线附近。
+- **焦距解算不依赖初始值**：解算的可信度取自"各组正交消失点给出的焦距估计是否一致"，
+  而不是"解算结果与当前焦距差多少"。因此即使初始焦距与真实值相差数倍（例如用默认
+  50mm 起步、真实是 35mm 或 85mm），也能一次解算到位。
+- **参考线绑定相机**：参考线记录自己属于哪台相机。切换相机后若直接点解算按钮，
+  插件会拒绝把旧相机的线用到新相机上，而不是把新相机搬走。
+- **平行线提示**：若某个轴画了 ≥2 条线却求不出消失点（投影后互相平行），状态栏会
+  提示该轴缺少约束，此时解算结果仅供参考。
 
 
 
@@ -98,6 +127,7 @@ This is a lightweight and highly efficient plugin for camera reconstruction and 
 - **Advanced Horizon Constraint**: Supported by a horizon visual system, it allows you to flexibly tweak the camera's pitch by directly dragging the horizon handle.
 - **Seamless Multi-Camera Support**: Whether you switch between cameras or create a new one, the plugin automatically handles data cleanup and seamless transitions in the background.
 - **Safe History Tracking**: Features an independent undo/redo stack for drawing operations to avoid conflicts with Blender’s global undo history.
+- **Hitchcock Zoom (Dolly Zoom)**: The focal-length slider at the bottom of the N-panel changes the focal length while dollying the camera along its own axis, so the 3D Cursor plane keeps exactly the same framing — the subject stays put while the background perspective compresses or expands.
 
 ---
 
@@ -143,6 +173,20 @@ When enabled, the plugin automatically infers and displays a blue horizon line b
 1. Look at the viewport. You will see a slightly larger **diamond-shaped handle** in the center of the horizon.
 2. While drawing mode is active, click and **drag this handle up or down** to forcefully adjust the camera's Pitch. The guide overlay is removed when drawing mode ends.
 3. **Note:** Dragging the handle introduces an intentional, manual "offset variation". Therefore, **whenever you subsequently attempt to modify or draw core perspective lines, any previously dragged manual horizon offset will be immediately reset to zero**. This ensures that rigorous mathematical solving is always prioritized based on your perspective lines.
+
+---
+
+## 🎬 Advanced Feature: Hitchcock Zoom (Dolly Zoom)
+
+At the **bottom** of the `CameraMatch` sidebar there is a **Hitchcock Zoom (Dolly Zoom)** focal-length slider:
+
+1. Finish matching the camera first (and place the 3D Cursor on a well-defined reference point in the photo).
+2. Drag the slider to change the focal length — the plugin **simultaneously dollies the camera along its own optical axis** so that the framing (size *and* position) of the plane at the 3D Cursor **stays exactly the same**.
+3. The result is the classic cinematic "Vertigo Effect": the subject does not move at all, while the background perspective compresses or expands.
+
+**Why it works**: the projected size of anything at depth `d` is proportional to `f / d`. Scaling focal length and depth by the same factor (`d′ = d · f′/f`) leaves every point on that depth plane at the same screen position. Note that the plugin uses the *cursor depth* rather than the straight-line camera-to-cursor distance — when the cursor is off-center, only depth scaling keeps the framing perfectly locked.
+
+> **Difference from the `Focal Length (mm)` slider above**: that one merely changes the focal length (compensating with `shift` to keep the cursor in place), so the image size changes. Hitchcock Zoom actually moves the camera, so it **will not break an already-matched composition** — ideal for tuning the "perspective intensity" after matching.
 
 ## 🤖 Automation Details
 If you are immersed in matching lines for one camera and suddenly switch to another camera in the Outliner—**Don't worry!**

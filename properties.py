@@ -63,7 +63,8 @@ def _solve_horizon_from_context(context):
         return
 
     cmp_data = getattr(scene, "cmp_data", None)
-    if cmp_data is None or len(cmp_data.lines) < 2:
+    # 门槛与 operators.solve_camera_core 保持一致（单点透视 1 条线即可解算）
+    if cmp_data is None or len(cmp_data.lines) < 1:
         return
 
     try:
@@ -101,87 +102,16 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
             pass
 
     def _compensate_shift_for_cursor_uv(self, scene, cam, target_uv):
-        render = scene.render
-        pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
-        if pixel_res_x <= 1e-8 or pixel_res_y <= 1e-8:
-            return
-
-        cursor_location = scene.cursor.location.copy()
-        shift_eps = 1e-4
-        max_shift_step = 0.02
-
-        for _ in range(3):
-            cur_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-            if not (np.isfinite(cur_view.x) and np.isfinite(cur_view.y)):
-                break
-
-            err_u = target_uv[0] - float(cur_view.x)
-            err_v = target_uv[1] - float(cur_view.y)
-            err_px = np.hypot(err_u * pixel_res_x, err_v * pixel_res_y)
-            if err_px < 0.25:
-                break
-
-            base_shift_x = float(cam.data.shift_x)
-            base_shift_y = float(cam.data.shift_y)
-
-            cam.data.shift_x = base_shift_x + shift_eps
-            self._update_view_layer()
-            view_sx = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-
-            cam.data.shift_x = base_shift_x
-            cam.data.shift_y = base_shift_y + shift_eps
-            self._update_view_layer()
-            view_sy = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-
-            cam.data.shift_y = base_shift_y
-            self._update_view_layer()
-
-            if not (
-                np.isfinite(view_sx.x) and np.isfinite(view_sx.y)
-                and np.isfinite(view_sy.x) and np.isfinite(view_sy.y)
-            ):
-                break
-
-            jac = np.array([
-                [(float(view_sx.x) - float(cur_view.x)) / shift_eps, (float(view_sy.x) - float(cur_view.x)) / shift_eps],
-                [(float(view_sx.y) - float(cur_view.y)) / shift_eps, (float(view_sy.y) - float(cur_view.y)) / shift_eps],
-            ])
-
-            if not np.all(np.isfinite(jac)):
-                break
-
-            try:
-                if np.linalg.cond(jac) > 1e4:
-                    break
-            except Exception:
-                break
-
-            delta, *_ = np.linalg.lstsq(jac, np.array([err_u, err_v]), rcond=None)
-            if not np.all(np.isfinite(delta)):
-                break
-
-            dsx = float(np.clip(delta[0] * 0.7, -max_shift_step, max_shift_step))
-            dsy = float(np.clip(delta[1] * 0.7, -max_shift_step, max_shift_step))
-
-            cam.data.shift_x = base_shift_x + dsx
-            cam.data.shift_y = base_shift_y + dsy
-            self._update_view_layer()
-
-            new_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-            if not (np.isfinite(new_view.x) and np.isfinite(new_view.y)):
-                cam.data.shift_x = base_shift_x
-                cam.data.shift_y = base_shift_y
-                self._update_view_layer()
-                break
-
-            new_err_u = target_uv[0] - float(new_view.x)
-            new_err_v = target_uv[1] - float(new_view.y)
-            new_err_px = np.hypot(new_err_u * pixel_res_x, new_err_v * pixel_res_y)
-            if (not np.isfinite(new_err_px)) or new_err_px >= err_px:
-                cam.data.shift_x = base_shift_x
-                cam.data.shift_y = base_shift_y
-                self._update_view_layer()
-                break
+        # 算法已统一到 utils.compensate_shift_for_target_uv（原先与 operators.py 里
+        # 的解算后补偿逻辑是两份几乎逐行重复的实现）。
+        utils.compensate_shift_for_target_uv(
+            scene,
+            cam,
+            scene.cursor.location.copy(),
+            target_uv,
+            update_view_layer=self._update_view_layer,
+            iterations=3,
+        )
 
     def get_focal_length_mm(self):
         scene = getattr(self, "id_data", None)
@@ -196,9 +126,15 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         if scene is None or cam is None:
             return
 
-        new_lens = float(max(value, 1.0))
-        if not np.isfinite(new_lens):
+        try:
+            new_lens = float(value)
+        except (TypeError, ValueError):
             return
+        # 属性右键 "Reset to Default Value" 会以 0.0 调用 setter，
+        # 直接忽略非法值，避免把焦距打到 1mm 这种极端状态。
+        if not np.isfinite(new_lens) or new_lens <= 0.0:
+            return
+        new_lens = min(max(new_lens, 1.0), 10000.0)
 
         old_lens = float(cam.data.lens)
         if abs(new_lens - old_lens) < 1e-6:
@@ -227,6 +163,54 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         if view_state is not None and getattr(context, "scene", None) == scene:
             utils.restore_camera_view_state(view_state)
 
+    def get_hitchcock_focal_mm(self):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if cam is None:
+            return 50.0
+        return float(cam.data.lens)
+
+    def set_hitchcock_focal_mm(self, value):
+        """
+        希区柯克变焦滑块：改焦距的同时让相机沿光轴前后移动，
+        使 3D 游标所在深度平面的构图（大小与位置）完全不变。
+
+        滑块每次回调都以"当前 lens"为起点做增量 dolly，因此连续拖拽会
+        从初始机位累积出一段连贯的滑动变焦，而不是每帧重新求解。
+        """
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if scene is None or cam is None:
+            return
+
+        try:
+            new_lens = float(value)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(new_lens) or new_lens <= 0.0:
+            return
+
+        context = bpy.context
+        view_state = None
+        if getattr(context, "scene", None) == scene:
+            view_state = utils.capture_camera_view_state(context)
+
+        try:
+            ok, reason = utils.apply_hitchcock_zoom(scene, cam, new_lens)
+            self._update_view_layer()
+            if not ok or reason == 'degenerate':
+                # 游标与相机重合/在相机后方时无法做 dolly，此时只改了焦距，
+                # 构图会被破坏 —— 明确告诉用户而不是静默留下一个坏状态。
+                iface_ = bpy.app.translations.pgettext_iface
+                key = ("Hitchcock zoom unavailable: 3D Cursor is behind the camera"
+                       if reason == 'degenerate' else "Hitchcock zoom failed")
+                self.last_hitchcock_message = iface_(key)
+            else:
+                self.last_hitchcock_message = ""
+        finally:
+            if view_state is not None and getattr(context, "scene", None) == scene:
+                utils.restore_camera_view_state(view_state)
+
     def update_rotation(self, context):
         import math
         import mathutils
@@ -243,20 +227,26 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         pivot = scene.cursor.location.copy()
         view_state = utils.capture_camera_view_state(solve_context)
 
-        delta_rot = self.world_rotation - self.last_world_rotation
-        self.last_world_rotation = self.world_rotation
+        # 用 try/finally 保证即使旋转/更新抛异常，也不会把用户的视口
+        # view_camera_offset / view_camera_zoom 留在被改过的状态。
+        try:
+            delta_rot = self.world_rotation - self.last_world_rotation
+            self.last_world_rotation = self.world_rotation
 
-        if abs(delta_rot) > 1e-6:
-            rot_mat = mathutils.Matrix.Rotation(delta_rot, 4, 'Z')
-            cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, rot_mat, pivot)
+            if abs(delta_rot) > 1e-6:
+                rot_mat = mathutils.Matrix.Rotation(delta_rot, 4, 'Z')
+                cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, rot_mat, pivot)
 
-        if self.flip_z_axis != self.last_flip_z:
-            self.last_flip_z = self.flip_z_axis
-            flip_mat = mathutils.Matrix.Rotation(math.pi, 4, 'X')
-            cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, flip_mat, pivot)
+            if self.flip_z_axis != self.last_flip_z:
+                self.last_flip_z = self.flip_z_axis
+                flip_mat = mathutils.Matrix.Rotation(math.pi, 4, 'X')
+                cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, flip_mat, pivot)
 
-        solve_context.view_layer.update()
-        utils.restore_camera_view_state(view_state)
+            solve_context.view_layer.update()
+        except Exception as e:
+            print(f"[CameraMatch] 手动旋转微调失败: {e}")
+        finally:
+            utils.restore_camera_view_state(view_state)
 
     def update_horizon(self, context):
         if is_horizon_updates_suppressed():
@@ -267,7 +257,8 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
             return
 
         cmp_data = getattr(scene, "cmp_data", None)
-        if cmp_data is None or len(cmp_data.lines) < 2:
+        # 与 operators.solve_camera_core 的门槛保持一致
+        if cmp_data is None or len(cmp_data.lines) < 1:
             return
 
         solve_context = _context_for_scene(scene, context)
@@ -277,10 +268,71 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
     focal_length_mm: bpy.props.FloatProperty(
         name="Focal Length (mm)",
         description="Camera focal length in millimeters",
+        default=50.0,
         min=1.0,
         max=10000.0,
         get=get_focal_length_mm,
         set=set_focal_length_mm,
+    )
+
+    hitchcock_focal_mm: bpy.props.FloatProperty(
+        name="Hitchcock Zoom",
+        description="Dolly zoom: change focal length while the camera moves along its own axis so the 3D Cursor plane keeps exactly the same framing",
+        default=50.0,
+        min=1.0,
+        max=10000.0,
+        soft_min=1.0,
+        soft_max=2000.0,
+        get=get_hitchcock_focal_mm,
+        set=set_hitchcock_focal_mm,
+    )
+
+    last_hitchcock_message: bpy.props.StringProperty(default="")
+
+    # 传感器宽度：直接改相机数据会让已解算的 lens/shift 与新传感器尺寸失去
+    # 一致性，所以包一层 setter，写回后立刻重解一次。
+    def get_sensor_width_mm(self):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if cam is None or getattr(cam, "data", None) is None:
+            return 36.0
+        return float(cam.data.sensor_width)
+
+    def set_sensor_width_mm(self, value):
+        scene = getattr(self, "id_data", None)
+        cam = getattr(scene, "camera", None)
+        if scene is None or cam is None or getattr(cam, "data", None) is None:
+            return
+        try:
+            new_value = float(value)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(new_value) or new_value <= 0.0:
+            return
+        if abs(new_value - float(cam.data.sensor_width)) < 1e-6:
+            return
+
+        cam.data.sensor_width = new_value
+        self._update_view_layer()
+
+        if len(getattr(self, "lines", [])) < 1:
+            return
+        try:
+            from . import operators
+            solve_context = _context_for_scene(scene, bpy.context)
+            if solve_context is not None:
+                operators.solve_camera_core(solve_context)
+        except Exception as e:
+            print(f"[CameraMatch] 传感器尺寸变更后重解算失败: {e}")
+
+    sensor_width_mm: bpy.props.FloatProperty(
+        name="Sensor (mm)",
+        description="Camera sensor width in millimeters; changing it re-solves the camera",
+        default=36.0,
+        min=0.1,
+        max=1000.0,
+        get=get_sensor_width_mm,
+        set=set_sensor_width_mm,
     )
 
     world_rotation: bpy.props.FloatProperty(

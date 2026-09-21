@@ -8,9 +8,15 @@ from . import utils, properties
 HORIZON_LOCK_THRESHOLD_PX = 8.0
 
 
-def solve_camera_core(context):
+def solve_camera_core(context, fast=False, _retry=0):
     """
     核心解算函数
+
+    :param fast: True 表示绘制/拖拽过程中的实时解算，降低焦距扫描密度以
+                 保住交互帧率；松手与点击 Match Camera 按钮时用 False
+                 （完整精度）。两种模式的解算路径与判据完全一致。
+    :param _retry: 内部使用。shift 补偿改变了主点基准时会用新 shift 重解一次，
+                   保证"解算输入的主点"与"解算输出的 shift"自洽。
     :return: (success, message)
     """
     scene = context.scene
@@ -18,13 +24,34 @@ def solve_camera_core(context):
     if not cam:
         return False, "No Active Camera"
 
+    iface_ = bpy.app.translations.pgettext_iface
+
     if getattr(cam.data, "type", None) != 'PERSP':
-        iface_ = bpy.app.translations.pgettext_iface
         return False, iface_("Only perspective cameras are supported")
 
-    lines = scene.cmp_data.lines
-    if len(lines) < 2:
+    cmp_data = scene.cmp_data
+
+    # 参考线是"属于某台相机"的。相机切换后的自动清理只发生在绘制模式里，
+    # 一旦 DrawLine 没在运行（Esc 退出、重开文件、直接点面板按钮），这里就是
+    # 唯一的防线 —— 否则会把 A 相机的线解算到 B 相机上（实测会把 80mm 的
+    # 相机直接搬成 35mm）。
+    lines_cam = getattr(cmp_data, "lines_camera", None)
+    if lines_cam is not None and lines_cam != cam:
+        return False, iface_("Guide lines belong to another camera")
+    if lines_cam is None:
+        # 未绑定（例如快照恢复失败）：认领给当前相机，避免功能卡死
+        cmp_data.lines_camera = cam
+
+    lines = cmp_data.lines
+    # 单点透视（ONE_POINT）只需要一个轴向的线段即可解算：另外两个轴向会由
+    # build_perspective_mode_constraints 注入"画面水平/垂直"合成约束补足。
+    if len(lines) < 1:
         return False, "Not enough lines"
+
+    # 完全落在画面外的参考线没有意义（用户看不到背景图就没法对齐），
+    # 全部越界时直接拒绝，避免解出 f=11mm 这种荒谬结果还报"成功"。
+    if utils.count_offscreen_lines(lines) >= len(lines):
+        return False, iface_("All guide lines are outside the camera frame")
 
     render = scene.render
     pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
@@ -34,14 +61,7 @@ def solve_camera_core(context):
     current_dist = (cam.location - cursor_location).length
     if current_dist < 0.1: current_dist = 10.0
 
-    principal_u = 0.5
-    principal_v = 0.5
-    probe_dist = max(current_dist, 1.0)
-    probe_world = cam.matrix_world.translation + (cam.matrix_world.to_quaternion() @ mathutils.Vector((0.0, 0.0, -probe_dist)))
-    principal_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, probe_world)
-    if np.isfinite(principal_view.x) and np.isfinite(principal_view.y):
-        principal_u = float(principal_view.x)
-        principal_v = float(principal_view.y)
+    principal_u, principal_v = utils.compute_principal_point_uv(scene, cam)
 
     # 2. 准备数据
     lines_data, vp_data_raw, vp_data, axis_weights, horizon_data = utils.solve_horizon_data(
@@ -58,6 +78,14 @@ def solve_camera_core(context):
     if len(active_axes) < 1:
         iface_ = bpy.app.translations.pgettext_iface
         return False, iface_("Requires at least one axis (min 1 line per axis)")
+
+    # 某个轴画了 >=2 条线却求不出消失点 => 这些线互相平行。此时该轴对旋转
+    # 几乎没有约束力，解算结果可能明显偏离（实测 2 条平行线会给出 78° 的
+    # 旋转误差），但过去仍然报"成功"。这里把它作为提示带回给用户。
+    parallel_axes = [
+        axis for axis in ('X', 'Y', 'Z')
+        if len(lines_data.get(axis, [])) >= 2 and axis not in vp_data_raw
+    ]
 
     perspective_constraints = utils.build_perspective_mode_constraints(
         lines_data,
@@ -135,6 +163,7 @@ def solve_camera_core(context):
                 pixel_res_y,
                 rot_init,
                 allow_focal_refine=allow_focal_refine,
+                fast=fast,
             )
             if not strict_result.get('ok', False):
                 return None
@@ -369,81 +398,14 @@ def solve_camera_core(context):
 
         if target_uv_for_shift is not None:
             try:
-                shift_eps = 1e-4
-                max_shift_step = 0.02
-
-                for _ in range(2):
-                    cur_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-                    if not (np.isfinite(cur_view.x) and np.isfinite(cur_view.y)):
-                        break
-
-                    err_u = target_uv_for_shift[0] - float(cur_view.x)
-                    err_v = target_uv_for_shift[1] - float(cur_view.y)
-                    err_px = np.hypot(err_u * pixel_res_x, err_v * pixel_res_y)
-                    if err_px < 0.25:
-                        break
-
-                    base_shift_x = float(cam.data.shift_x)
-                    base_shift_y = float(cam.data.shift_y)
-
-                    cam.data.shift_x = base_shift_x + shift_eps
-                    context.view_layer.update()
-                    view_sx = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-
-                    cam.data.shift_x = base_shift_x
-                    cam.data.shift_y = base_shift_y + shift_eps
-                    context.view_layer.update()
-                    view_sy = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-
-                    cam.data.shift_y = base_shift_y
-                    context.view_layer.update()
-
-                    if not (
-                        np.isfinite(view_sx.x) and np.isfinite(view_sx.y)
-                        and np.isfinite(view_sy.x) and np.isfinite(view_sy.y)
-                    ):
-                        break
-
-                    jac = np.array([
-                        [(float(view_sx.x) - float(cur_view.x)) / shift_eps, (float(view_sy.x) - float(cur_view.x)) / shift_eps],
-                        [(float(view_sx.y) - float(cur_view.y)) / shift_eps, (float(view_sy.y) - float(cur_view.y)) / shift_eps],
-                    ])
-
-                    if not np.all(np.isfinite(jac)):
-                        break
-
-                    try:
-                        if np.linalg.cond(jac) > 1e4:
-                            break
-                    except Exception:
-                        break
-
-                    delta, *_ = np.linalg.lstsq(jac, np.array([err_u, err_v]), rcond=None)
-                    if not np.all(np.isfinite(delta)):
-                        break
-
-                    dsx = float(np.clip(delta[0] * 0.7, -max_shift_step, max_shift_step))
-                    dsy = float(np.clip(delta[1] * 0.7, -max_shift_step, max_shift_step))
-
-                    cam.data.shift_x = base_shift_x + dsx
-                    cam.data.shift_y = base_shift_y + dsy
-                    context.view_layer.update()
-
-                    new_view = bpy_extras.object_utils.world_to_camera_view(scene, cam, cursor_location)
-                    if not (np.isfinite(new_view.x) and np.isfinite(new_view.y)):
-                        cam.data.shift_x = base_shift_x
-                        cam.data.shift_y = base_shift_y
-                        context.view_layer.update()
-                        break
-
-                    new_err_u = target_uv_for_shift[0] - float(new_view.x)
-                    new_err_v = target_uv_for_shift[1] - float(new_view.y)
-                    new_err_px = np.hypot(new_err_u * pixel_res_x, new_err_v * pixel_res_y)
-                    if (not np.isfinite(new_err_px)) or new_err_px >= err_px:
-                        cam.data.shift_x = base_shift_x
-                        cam.data.shift_y = base_shift_y
-                        context.view_layer.update()
-                        break
+                utils.compensate_shift_for_target_uv(
+                    scene,
+                    cam,
+                    cursor_location,
+                    target_uv_for_shift,
+                    update_view_layer=context.view_layer.update,
+                    iterations=2,
+                )
 
                 if np.isfinite(cam.data.shift_x) and np.isfinite(cam.data.shift_y):
                     shift_x = float(cam.data.shift_x)
@@ -466,9 +428,10 @@ def solve_camera_core(context):
         mode_hint = ""
         if solve_mode_hint_key:
             mode_hint = " " + iface_(solve_mode_hint_key)
+        if parallel_axes:
+            mode_hint += " " + iface_("Parallel lines (no vanishing point) on axis ") + "/".join(parallel_axes)
 
         msg = iface_("Success: ") + f"f={f_mm:.1f}mm," + iface_(" Shift=") + f"({shift_x:.2f}, {shift_y:.2f})" + mode_hint
-        return True, msg
 
     except Exception as e:
         print(f"[CameraMatch] Apply transform failed: {e}")
@@ -477,6 +440,17 @@ def solve_camera_core(context):
     finally:
         properties.resume_horizon_updates()
         utils.restore_camera_view_state(view_state)
+
+    # 自洽性收尾：解算用的主点是由**解算前**的 shift 决定的，而上面的补偿又
+    # 改写了 shift。若不重解，线段坐标的含义与最终 shift 就对不上，结果会稳定
+    # 停在"依赖操作历史"的解上（实测初始 shift_x=0.05 时焦距偏 1.55%，
+    # 0.10 时偏 2.77%）。这里用新的 shift 再解一次；shift 变化量本身会随重解
+    # 迅速收敛，因此只重试一轮即可。
+    shift_drift = max(abs(shift_x - current_shift_x), abs(shift_y - current_shift_y))
+    if _retry < 1 and np.isfinite(shift_drift) and shift_drift > 1e-4:
+        return solve_camera_core(context, fast=fast, _retry=_retry + 1)
+
+    return True, msg
 
 
 class CMP_OT_MatchCamera(bpy.types.Operator):

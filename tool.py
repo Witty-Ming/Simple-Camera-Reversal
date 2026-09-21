@@ -77,10 +77,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         if len(cmp_data.lines) == 0:
             cmp_data.lines_camera = context.scene.camera
         elif cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
-            self.clear_all_lines(context, push_history=False, run_solve=False)
-            self.undo_stack.clear()
-            self.redo_stack.clear()
-            self.last_error = "Active camera changed, guide lines cleared"
+            self._on_camera_changed(context, announce=True)
         try:
             from . import gpu_draw
             gpu_draw.register()
@@ -89,8 +86,63 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
         context.window_manager.modal_handler_add(self)
         self.update_header(context)
-        context.area.tag_redraw()
+        if getattr(context, "area", None) is not None:
+            context.area.tag_redraw()
         return {'RUNNING_MODAL'}
+
+    def _on_camera_changed(self, context, announce=False):
+        """
+        相机切换后的统一清理。原先 invoke / modal / trigger_solve 三处各写一遍，
+        收尾却各不相同（有的清撤销栈、有的抹掉错误信息、有的漏清栈），这里统一。
+        """
+        self.clear_all_lines(context, push_history=False, reset_error=False)
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.last_error = ("Active camera changed, guide lines cleared" if announce else "")
+        self.update_header(context)
+
+    def _settle_pending_states(self, context, solve=True):
+        """
+        把"需要后续鼠标事件才能收尾"的瞬时状态就地收尾。
+
+        用于两类事件被吞掉的场景：窗口失焦（Blender 通常不补发
+        LEFTMOUSE RELEASE）与离开相机视图（该分支在事件处理之前就 return 了）。
+        不收尾的话 DRAWING/DRAGGING 会滞留，回到相机视图一动鼠标就会继续改写
+        lines[-1]（可能已经是另一条已完成的线段）。
+        """
+        try:
+            if self.state == self.STATE_DRAWING:
+                self.state = self.STATE_IDLE
+                context.scene.cmp_data.is_creating_line = False
+                self.draw_axis_constraint = None
+                self.draw_anchor_norm = None
+                self.draw_anchor_value_norm = None
+                self.draw_shift_state = None
+                if solve:
+                    self.trigger_solve(context, force=True)
+            elif self.state == self.STATE_WAITING_DRAG:
+                self.state = self.STATE_IDLE
+                self.draw_axis_constraint = None
+                context.scene.cmp_data.is_creating_line = False
+            elif self.state == self.STATE_DRAGGING:
+                self.finish_drag_history(context)
+                self.state = self.STATE_EDITING
+                self.line_drag_start_mouse_norm = None
+                self.line_drag_start_value_norm = None
+                self.line_drag_shift_state = None
+                if solve:
+                    self.trigger_solve(context, force=True)
+            elif self.state == self.STATE_DRAG_HORIZON_OFFSET:
+                self.finish_drag_history(context)
+                self.state = self.STATE_IDLE
+                self.horizon_drag_shift_state = None
+                self.end_horizon_drag_updates()
+        except Exception as e:
+            print(f"[CameraMatch] 状态收尾失败: {e}")
+            try:
+                self.end_horizon_drag_updates()
+            except Exception:
+                properties.reset_horizon_update_state()
 
     def primary_modifier_pressed(self, event):
         return event.ctrl or getattr(event, "oskey", False)
@@ -203,15 +255,22 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         if event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
             return {'PASS_THROUGH'}
 
-        # 实现在绘制模式下切换相机时，自动进行数据清理和重绑，彻底告别报错弹窗
+        # 窗口失焦（Alt+Tab 等）时 Blender 通常不会补发 LEFTMOUSE RELEASE，
+        # 若不在这里收尾，绘制/拖拽状态会滞留，地平线的更新抑制也会一直挂着
+        # （表现为勾选 Enable Horizon 毫无反应）。
+        if event.type == 'WINDOW_DEACTIVATE':
+            self._settle_pending_states(context)
+            return {'RUNNING_MODAL'}
+
+        # 绘制模式下切换相机时自动清理并重绑
         if cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
-            self.clear_all_lines(context, push_history=False, run_solve=False)
-            self.undo_stack.clear()
-            self.redo_stack.clear()
-            self.last_error = ""
-            self.update_header(context)
+            self._on_camera_changed(context)
 
         if not utils.is_camera_view(context):
+            # 离开相机视图时同样要收尾，否则 RELEASE 被吞掉会让状态滞留：
+            # 回到相机视图后继续移动鼠标会继续改写 lines[-1]（可能是另一条
+            # 已完成的线段）。此时不触发解算（当前视图已不是相机视图）。
+            self._settle_pending_states(context, solve=False)
             self.last_error = "Please stay in Camera View while drawing"
             self.update_header(context)
             return {'RUNNING_MODAL'}
@@ -258,7 +317,10 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                         self.reset_horizon_manual_offset(context)
                         context.scene.cmp_data.active_index = -1
                         self.state = self.STATE_IDLE
-                        self.trigger_solve(context)
+                        # 删除是一次离散操作，必须用 force 绕过 1/28s 节流并走
+                        # 完整精度 —— 否则刚画完线就删会被整段跳过，相机停在
+                        # "按已删除线段解算"的姿态上。
+                        self.trigger_solve(context, force=True)
 
         x, y = event.mouse_region_x, event.mouse_region_y
         lines = context.scene.cmp_data.lines
@@ -408,11 +470,13 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         pixel_res_x, pixel_res_y = utils.get_effective_render_size(render)
 
         self.horizon_drag_start_offset = float(cmp_data.horizon_offset_px)
-        self.drag_history = self.state_to_snapshot(context)
 
         if handle != 'OFFSET':
             return
 
+        # 快照放在确认要开始拖拽之后：否则提前写入的 drag_history 会让
+        # begin_drag_history 的 `if self.drag_history is None` 跳过取快照。
+        self.drag_history = self.state_to_snapshot(context)
         self.state = self.STATE_DRAG_HORIZON_OFFSET
         self.horizon_drag_start_mouse_render = utils.region_xy_to_render_centered_px(
             (float(x), float(y)),
@@ -630,8 +694,9 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
     def restore_snapshot(self, context, snapshot):
         if snapshot is None:
-            return
+            return None
 
+        warning = None
         cmp_data = context.scene.cmp_data
         view_state = utils.capture_camera_view_state(context)
         properties.suppress_horizon_updates()
@@ -650,7 +715,13 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             cmp_data.active_index = active_index if 0 <= active_index < line_count else -1
 
             cam_name = snapshot.get('lines_camera_name')
-            cmp_data.lines_camera = bpy.data.objects.get(cam_name) if cam_name else None
+            restored_cam = bpy.data.objects.get(cam_name) if cam_name else None
+            # 名字失效（相机被重命名/删除）或指向非相机对象时必须回退到当前
+            # 相机：留成 None 会让后续所有 "lines_camera is not None and ..."
+            # 的相机切换检查被短路，清理逻辑永久失效。
+            if restored_cam is None or restored_cam.type != 'CAMERA':
+                restored_cam = context.scene.camera
+            cmp_data.lines_camera = restored_cam
 
             cmp_data.horizon_enabled = bool(snapshot.get('horizon_enabled', cmp_data.horizon_enabled))
             cmp_data.horizon_offset_px = float(snapshot.get('horizon_offset_px', cmp_data.horizon_offset_px))
@@ -670,7 +741,12 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
             camera_state = snapshot.get('camera')
             camera = context.scene.camera
-            if camera_state and camera is not None and camera.name == camera_state.get('name'):
+            if camera_state and camera is not None:
+                # 相机被重命名后名字会对不上。此时仍然把快照状态应用到当前
+                # 相机，否则会出现"线段恢复了、相机没恢复"的半吊子撤销，
+                # 画面与线段不匹配，用户以为撤销失败。
+                if camera.name != camera_state.get('name'):
+                    warning = "Camera renamed: snapshot applied to the active camera"
                 matrix_world = camera_state.get('matrix_world')
                 if matrix_world is not None:
                     camera.matrix_world = mathutils.Matrix(matrix_world)
@@ -682,6 +758,8 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             properties.resume_horizon_updates()
             utils.restore_camera_view_state(view_state)
 
+        return warning
+
     def push_history(self, context):
         snapshot = self.state_to_snapshot(context)
         self.undo_stack.append(snapshot)
@@ -689,14 +767,35 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             self.undo_stack.pop(0)
         self.redo_stack.clear()
 
+    def _after_history_navigation(self, context):
+        """
+        撤销/重做之后必须复位瞬时状态。
+
+        否则：画线 B 的途中按 Ctrl+Z，lines 回到 [A] 而 state 仍是 DRAWING，
+        继续移动鼠标会把 lines[-1]（此时是已完成的线 A）的 end 改写掉，
+        松手即固化破坏。
+        """
+        context.scene.cmp_data.is_creating_line = False
+        self.state = self.STATE_IDLE
+        self.active_handle = -1
+        self.draw_axis_constraint = None
+        self.draw_anchor_norm = None
+        self.draw_anchor_value_norm = None
+        self.draw_shift_state = None
+        self.line_drag_start_mouse_norm = None
+        self.line_drag_start_value_norm = None
+        self.line_drag_shift_state = None
+        self.drag_history = None
+
     def undo(self, context):
         if not self.undo_stack:
             return
         current = self.state_to_snapshot(context)
         self.redo_stack.append(current)
         snapshot = self.undo_stack.pop()
-        self.restore_snapshot(context, snapshot)
-        self.last_error = ""
+        warning = self.restore_snapshot(context, snapshot)
+        self._after_history_navigation(context)
+        self.last_error = warning or ""
         self.update_header(context)
 
     def redo(self, context):
@@ -704,9 +803,12 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             return
         current = self.state_to_snapshot(context)
         self.undo_stack.append(current)
+        if len(self.undo_stack) > 128:
+            self.undo_stack.pop(0)
         snapshot = self.redo_stack.pop()
-        self.restore_snapshot(context, snapshot)
-        self.last_error = ""
+        warning = self.restore_snapshot(context, snapshot)
+        self._after_history_navigation(context)
+        self.last_error = warning or ""
         self.update_header(context)
 
     def begin_drag_history(self, context, _idx=-1):
@@ -717,33 +819,128 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         if self.drag_history is None:
             return
         current = self.state_to_snapshot(context)
-        if current != self.drag_history:
+        # 快照里含 16 个 float 的矩阵，直接 != 比较会让浮点抖动把"点一下端点
+        # 立刻松手"的零位移操作也塞进撤销栈。
+        if not self._snapshots_equal(current, self.drag_history):
             self.undo_stack.append(self.drag_history)
             if len(self.undo_stack) > 128:
                 self.undo_stack.pop(0)
             self.redo_stack.clear()
         self.drag_history = None
 
+    @staticmethod
+    def _snapshots_equal(a, b, tol=1e-6):
+        if a is None or b is None:
+            return a is b
+        if len(a.get('lines', [])) != len(b.get('lines', [])):
+            return False
+        for la, lb in zip(a.get('lines', []), b.get('lines', [])):
+            if la.get('axis') != lb.get('axis'):
+                return False
+            for key in ('start', 'end'):
+                va, vb = la.get(key, (0.0, 0.0)), lb.get(key, (0.0, 0.0))
+                if abs(va[0] - vb[0]) > tol or abs(va[1] - vb[1]) > tol:
+                    return False
+        for key in ('active_index', 'lines_camera_name', 'horizon_enabled'):
+            if a.get(key) != b.get(key):
+                return False
+        for key in ('world_rotation', 'last_world_rotation'):
+            if abs(float(a.get(key, 0.0)) - float(b.get(key, 0.0))) > tol:
+                return False
+        for key in ('flip_z_axis', 'last_flip_z'):
+            if bool(a.get(key, False)) != bool(b.get(key, False)):
+                return False
+        if abs(float(a.get('horizon_offset_px', 0.0)) - float(b.get('horizon_offset_px', 0.0))) > tol:
+            return False
+        ca, cb = a.get('camera'), b.get('camera')
+        if (ca is None) != (cb is None):
+            return False
+        if ca is not None and cb is not None:
+            if ca.get('name') != cb.get('name'):
+                return False
+            if abs(float(ca.get('lens', 0.0)) - float(cb.get('lens', 0.0))) > tol:
+                return False
+            if abs(float(ca.get('shift_x', 0.0)) - float(cb.get('shift_x', 0.0))) > tol:
+                return False
+            if abs(float(ca.get('shift_y', 0.0)) - float(cb.get('shift_y', 0.0))) > tol:
+                return False
+            ma, mb = ca.get('matrix_world'), cb.get('matrix_world')
+            if ma is not None and mb is not None:
+                for ra, rb in zip(ma, mb):
+                    for va, vb in zip(ra, rb):
+                        if abs(float(va) - float(vb)) > tol:
+                            return False
+        return True
+
     def reset_horizon_manual_offset(self, context):
         cmp_data = context.scene.cmp_data
         if cmp_data.horizon_offset_px != 0.0:
             cmp_data.horizon_offset_px = 0.0
 
-    def clear_all_lines(self, context, push_history=True, run_solve=True):
+    def _revert_manual_adjust(self, context):
+        """
+        把"绕 3D 游标旋转 / 翻转 Z 轴"的手动微调反向应用回相机。
+
+        clear_all_lines 会清零 world_rotation / flip_z_axis，但清零本身不会
+        动相机。若不把微调反向旋转回去，就会出现"状态说没微调、画面却还带着
+        微调"的失配，用户接着画线并解算时画面会突然跳回未微调的姿态。
+        """
+        cmp_data = context.scene.cmp_data
+        cam = context.scene.camera
+        if cam is None or getattr(cam, "data", None) is None:
+            return
+
+        world_rotation = float(getattr(cmp_data, "world_rotation", 0.0))
+        flip_z = bool(getattr(cmp_data, "flip_z_axis", False))
+        if abs(world_rotation) <= 1e-9 and not flip_z:
+            return
+
+        pivot = context.scene.cursor.location.copy()
+        view_state = utils.capture_camera_view_state(context)
+        try:
+            # 注意顺序：update_rotation 的应用顺序是"先绕 Z 旋转、后绕 X 翻转"，
+            # 因此逆变换必须**先撤销翻转、再撤销旋转**（两者绕不同轴、不可交换）。
+            if flip_z:
+                # 绕 X 轴 180° 的逆变换就是它自己
+                undo_flip = mathutils.Matrix.Rotation(math.pi, 4, 'X')
+                cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, undo_flip, pivot)
+            if abs(world_rotation) > 1e-9:
+                undo_rot = mathutils.Matrix.Rotation(-world_rotation, 4, 'Z')
+                cam.matrix_world = utils.rotate_matrix_around_point(cam.matrix_world, undo_rot, pivot)
+            context.view_layer.update()
+        except Exception as e:
+            print(f"[CameraMatch] 还原手动微调失败: {e}")
+        finally:
+            utils.restore_camera_view_state(view_state)
+
+    def clear_all_lines(self, context, push_history=True, reset_error=True):
+        """
+        清空当前相机的全部参考线与解算缓存。
+
+        :param push_history: 是否把清空动作记入撤销栈（相机切换时的自动清理不记）
+        :param reset_error: 是否顺带清掉状态栏错误信息（相机切换时会紧接着写入新提示）
+        """
         cmp_data = context.scene.cmp_data
         if push_history and (len(cmp_data.lines) > 0 or cmp_data.active_index != -1):
             self.push_history(context)
 
+        # 顺序很重要：**先清空线段，再重置地平线偏移**。
+        # reset_horizon_manual_offset 会把 horizon_offset_px 归零，而该属性带
+        # update_horizon 回调 —— 若此时线段还在，就会"拿马上要被删掉的线段再
+        # 完整解算一次"，把相机姿态改掉，用户按 Alt+X 后画面会莫名跳变。
+        # 线段先清掉，回调里的 len(lines) < 1 判断会直接放行。
+        cmp_data.lines.clear()
+        cmp_data.active_index = -1
+
         self.reset_horizon_manual_offset(context)
-        
-        # 彻底清理解算相关的旋转与翻转状态，避免残留影响新绘制的线段或新相机
+
+        # 先把微调反向应用回相机，再清零状态 —— 保证"状态"与"画面"始终一致
+        self._revert_manual_adjust(context)
         cmp_data.last_world_rotation = 0.0
         cmp_data.world_rotation = 0.0
         cmp_data.last_flip_z = False
         cmp_data.flip_z_axis = False
 
-        cmp_data.lines.clear()
-        cmp_data.active_index = -1
         cmp_data.lines_camera = context.scene.camera
 
         self.state = self.STATE_IDLE
@@ -760,7 +957,7 @@ class CMP_OT_DrawLine(bpy.types.Operator):
 
         self.end_horizon_drag_updates()
 
-        if run_solve:
+        if reset_error:
             self.last_error = ""
             self.update_header(context)
 
@@ -781,6 +978,9 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         self.state = self.STATE_DRAWING
 
     def should_run_realtime_solve(self, context):
+        # 拖拽过程中的实时解算仍要求 >= 2 条线：单条线在拖拽时只有一个自由度，
+        # 每帧解算会让相机跟着鼠标乱摆。单点透视的第一次解算交给松手时的
+        # force 调用（此时 solve_camera_core 允许 1 条线 + 合成约束）。
         cmp_data = context.scene.cmp_data
         return len(cmp_data.lines) >= 2
 
@@ -789,10 +989,10 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             cmp_data = context.scene.cmp_data
             if cmp_data.lines_camera is not None and cmp_data.lines_camera != context.scene.camera:
                 # 保底处理：如果触发了解算时还是另一个相机，这里直接自动重置
-                self.clear_all_lines(context, push_history=False, run_solve=False)
+                self.clear_all_lines(context, push_history=False, reset_error=False)
                 return
 
-            if len(cmp_data.lines) < 2:
+            if len(cmp_data.lines) < 1:
                 self.last_error = ""
                 self.update_header(context)
                 return
@@ -810,7 +1010,8 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 return
 
             from . import operators
-            success, msg = operators.solve_camera_core(context)
+            # 拖拽中走快速档，松手 / 按钮触发走完整精度
+            success, msg = operators.solve_camera_core(context, fast=not force)
             if not success:
                 self.last_error = msg
             else:
@@ -818,8 +1019,15 @@ class CMP_OT_DrawLine(bpy.types.Operator):
             self.last_solve_ts = now
             self.update_header(context)
         except Exception as e:
-            print(e)
-            pass
+            # 必须写进 last_error 并更新时间戳：否则状态栏会一直显示上一次的
+            # "Success"，而且每个 MOUSEMOVE 都会重试一次异常路径，持续卡顿。
+            print(f"[CameraMatch] Realtime solve error: {e}")
+            self.last_error = f"Solve error: {e}"
+            self.last_solve_ts = time.time()
+            try:
+                self.update_header(context)
+            except Exception:
+                pass
 
     def quit(self, context):
         if getattr(self, "_cleanup_done", False):
@@ -829,11 +1037,24 @@ class CMP_OT_DrawLine(bpy.types.Operator):
         try:
             self.end_horizon_drag_updates()
         except Exception:
-            properties.reset_horizon_update_state()
+            # 只清掉本实例可能留下的抑制，不做全局 reset（那会误清另一个
+            # 窗口里正在拖拽的实例的抑制状态）。
+            self.horizon_drag_updates_suppressed = False
+            properties.resume_horizon_updates()
+
+        # 先注销绘制层并拿到"是否真的注销了"。多视图场景下另一个实例可能仍在
+        # 绘制，此时不能把 Scene 级的 is_drawing_mode 关掉（否则对方的控制点
+        # 会一起消失）。
+        fully_closed = True
+        try:
+            from . import gpu_draw
+            fully_closed = bool(gpu_draw.unregister())
+        except Exception:
+            fully_closed = True
 
         scene = getattr(context, "scene", None)
         cmp_data = getattr(scene, "cmp_data", None) if scene is not None else None
-        if cmp_data is not None:
+        if cmp_data is not None and fully_closed:
             cmp_data.is_drawing_mode = False
             cmp_data.is_creating_line = False
             cmp_data.active_index = -1
@@ -845,12 +1066,6 @@ class CMP_OT_DrawLine(bpy.types.Operator):
                 area.tag_redraw()
             except Exception:
                 pass
-
-        try:
-            from . import gpu_draw
-            gpu_draw.unregister()
-        except Exception:
-            pass
 
     def cancel(self, context):
         self.quit(context)
