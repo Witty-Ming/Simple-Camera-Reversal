@@ -351,25 +351,40 @@ def draw_callback():
 def redraw_timer():
     try:
         context = bpy.context
-        screen = getattr(context, "screen", None)
         scene = getattr(context, "scene", None)
         cmp_data = getattr(scene, "cmp_data", None) if scene is not None else None
-        if cmp_data is not None and cmp_data.lines and screen:
+        if cmp_data is not None and cmp_data.lines:
             scene_camera = getattr(scene, "camera", None)
-            for area in screen.areas:
-                if area.type != 'VIEW_3D':
-                    continue
-                space = getattr(area.spaces, "active", None)
-                if space is None or space.type != 'VIEW_3D':
-                    continue
-                rv3d = getattr(space, "region_3d", None)
-                if rv3d is None or rv3d.view_perspective != 'CAMERA':
-                    continue
-                # 与绘制回调保持一致：只重绘真正显示 scene.camera 的视图
-                space_camera = getattr(space, "camera", None)
-                if space_camera is not None and space_camera != scene_camera:
-                    continue
-                area.tag_redraw()
+            # 必须遍历所有窗口：context.screen 只是当前窗口的 screen，多窗口
+            # 场景下另一个窗口里的相机视图收不到 tag_redraw，虚线动画会停住。
+            screens = []
+            seen_ids = set()
+            window_manager = getattr(context, "window_manager", None)
+            if window_manager is not None:
+                for window in window_manager.windows:
+                    screen = getattr(window, "screen", None)
+                    if screen is not None and id(screen) not in seen_ids:
+                        seen_ids.add(id(screen))
+                        screens.append(screen)
+            if not screens:
+                screen = getattr(context, "screen", None)
+                if screen is not None:
+                    screens.append(screen)
+            for screen in screens:
+                for area in screen.areas:
+                    if area.type != 'VIEW_3D':
+                        continue
+                    space = getattr(area.spaces, "active", None)
+                    if space is None or space.type != 'VIEW_3D':
+                        continue
+                    rv3d = getattr(space, "region_3d", None)
+                    if rv3d is None or rv3d.view_perspective != 'CAMERA':
+                        continue
+                    # 与绘制回调保持一致：只重绘真正显示 scene.camera 的视图
+                    space_camera = getattr(space, "camera", None)
+                    if space_camera is not None and space_camera != scene_camera:
+                        continue
+                    area.tag_redraw()
         else:
             # 没有参考线时不需要流动虚线动画，降频以省下无谓的主线程唤醒
             return 0.25
@@ -438,6 +453,7 @@ def unregister(force=False):
         if _ref_count > 0:
             return False
 
+    handler_removed = True
     if _handle:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_handle, 'WINDOW')
@@ -445,6 +461,7 @@ def unregister(force=False):
             # 只有确认移除成功才清空句柄：否则这个仍然注册着的 handler
             # 会永久泄漏，而后续 register() 还会再加一个。
             print(f"[CameraMatch] 移除绘制回调失败（保留句柄以便重试）: {e}")
+            handler_removed = False
         else:
             _handle = None
 
@@ -459,6 +476,12 @@ def unregister(force=False):
             bpy.app.handlers.load_post.remove(_on_load_post)
     except Exception:
         pass
+
+    if not handler_removed:
+        # 绘制回调仍然挂着，就不能宣告"已注销"：调用方会据此关闭 Scene 级的
+        # is_drawing_mode，而另一个视图的实例可能还在用这个 handler 绘制。
+        # 不清引用计数，保留句柄让下一次 register() 复用而不是重复添加。
+        return False
 
     _ref_count = 0
     _shader_2d_color = None

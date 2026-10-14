@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Simple Camera Match",
     "author": "WittyMing",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (4, 2, 0),
     "location": "View3D > N-Panel > CameraMatch",
     "description": "Reconstruct camera perspective by drawing lines",
@@ -19,11 +19,13 @@ from . import tool
 from . import translation
 
 def register():
-    translation.register()
-    properties.register()
-    operators.register()
-    tool.register()
-    ui.register()
+    # 与 unregister 对称：单步失败不能阻断后续步骤。否则会出现"属性注册了、
+    # 操作符没注册"这类半吊子状态 —— UI 按钮点不动，却查不出原因。
+    _safe("translation", translation.register)
+    _safe("properties", properties.register)
+    _safe("operators", operators.register)
+    _safe("tool", tool.register)
+    _safe("ui", ui.register)
 
 
 def _safe(step, func):

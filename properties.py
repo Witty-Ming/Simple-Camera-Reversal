@@ -207,6 +207,11 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
                 self.last_hitchcock_message = iface_(key)
             else:
                 self.last_hitchcock_message = ""
+        except Exception as e:
+            # 异常路径也必须更新提示：否则面板上一直挂着上一次的旧消息
+            # （比如"不可用"），用户以为这次也没生效，实际是崩在了别处。
+            print(f"[CameraMatch] Hitchcock zoom failed: {e}")
+            self.last_hitchcock_message = bpy.app.translations.pgettext_iface("Hitchcock zoom failed")
         finally:
             if view_state is not None and getattr(context, "scene", None) == scene:
                 utils.restore_camera_view_state(view_state)
@@ -218,10 +223,17 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         scene = getattr(self, "id_data", None)
         solve_context = _context_for_scene(scene, context)
         if solve_context is None:
+            # 提前返回也必须回写基准值。否则这次滑动被"记在账上"却没执行，
+            # 下次相机可用时 delta = world_rotation - last_world_rotation 会把
+            # 积压的增量一次性全放出来，画面突然转一大圈。
+            self.last_world_rotation = self.world_rotation
+            self.last_flip_z = self.flip_z_axis
             return
 
         cam = scene.camera
         if not cam:
+            self.last_world_rotation = self.world_rotation
+            self.last_flip_z = self.flip_z_axis
             return
 
         pivot = scene.cursor.location.copy()
@@ -289,6 +301,18 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
 
     last_hitchcock_message: bpy.props.StringProperty(default="")
 
+    # 上一次解算给出的"能解算、但输入可疑"类提示（线条不一致、焦距不可辨识、
+    # 某轴线段互相平行等）。这类情况解算仍然成功，所以走不到 last_error 那条路，
+    # 过去只在点 Match Camera 按钮时用 self.report 在状态栏闪一下，实时绘制时
+    # 更是被 tool.trigger_solve 直接丢弃 —— 用户根本看不到。这里持久保存，
+    # 由 N 面板常驻显示（带 alert 高亮），绘制模式的状态栏也一并显示。
+    last_solve_warning: bpy.props.StringProperty(default="")
+
+    # 是否已经跑过一次解算。N 面板的线条检查行常驻显示，靠它区分
+    # "还没解算过"（中性提示）和"解算过且没有问题"（绿色对勾）——
+    # 只看 last_solve_warning 是否为空的话，这两种情况长得一模一样。
+    last_solve_checked: bpy.props.BoolProperty(default=False)
+
     # 传感器宽度：直接改相机数据会让已解算的 lens/shift 与新传感器尺寸失去
     # 一致性，所以包一层 setter，写回后立刻重解一次。
     def get_sensor_width_mm(self):
@@ -335,6 +359,21 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         set=set_sensor_width_mm,
     )
 
+    def get_world_rotation(self):
+        return float(self.get("world_rotation", 0.0))
+
+    def set_world_rotation(self, value):
+        try:
+            new_value = float(value)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(new_value):
+            # nan/inf 会污染基准值 last_world_rotation：delta 变成 nan 或巨大
+            # 值后，用户再把滑块拨回 0 时画面会突然转过 180 度（实测 rotZ
+            # 从 130 度跳到 -50 度）。
+            return
+        self["world_rotation"] = max(-3.1415926, min(3.1415926, new_value))
+
     world_rotation: bpy.props.FloatProperty(
         name="3D Cursor Rotation",
         description="Rotate camera around 3D cursor",
@@ -343,6 +382,8 @@ class CMP_SceneProperties(bpy.types.PropertyGroup):
         max=3.1415926,
         subtype='ANGLE',
         unit='ROTATION',
+        get=get_world_rotation,
+        set=set_world_rotation,
         update=update_rotation
     )
 
@@ -376,7 +417,11 @@ def register():
     reset_horizon_update_state()
     utils.register_class_safe(CMP_Line)
     utils.register_class_safe(CMP_SceneProperties)
-    bpy.types.Scene.cmp_data = bpy.props.PointerProperty(type=CMP_SceneProperties)
+    # 已经有 cmp_data 时不要重建：重载插件时如果 unregister 只成功了一半
+    # （比如 PointerProperty 删除失败），无条件重新赋值会让所有场景里已存的
+    # 线段、相机绑定、撤销基准全部丢失 —— 用户看到的是"线全没了"。
+    if not hasattr(bpy.types.Scene, "cmp_data"):
+        bpy.types.Scene.cmp_data = bpy.props.PointerProperty(type=CMP_SceneProperties)
 
 
 def unregister():

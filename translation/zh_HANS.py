@@ -57,6 +57,11 @@ data = {
     "Hitchcock zoom unavailable: 3D Cursor is behind the camera": "无法滑动变焦：3D 游标位于相机后方",
     "Hitchcock zoom failed": "滑动变焦失败",
     "Parallel lines (no vanishing point) on axis ": "该轴的线互相平行(无消失点): ",
+    "Inconsistent lines (not one family of parallel lines) on axis ": "该轴的线不是同一组空间平行线: ",
+    "Focal length not solvable: needs 2+ lines on each of two axes": "焦距无法解算：需要两个轴各有 2 条以上线段",
+    "Line check passed": "线条检查通过",
+    "Not solved yet": "尚未解算",
+    "Cursor lock did not converge": "游标对齐未收敛（3D 游标可能不在目标位置上）",
 
     # 属性
     "3D Cursor Rotation": "3D游标旋转",
@@ -88,6 +93,6 @@ data = {
     " | Camera changed: press Alt+X to clear old guides": " | 相机已变化: 按 Alt+X 清除旧参考线",
     " | Error: ": " | 错误: ",
     "Constrained solve: focal refined": "约束模式解算：焦距已细化",
-    "Constrained solve: focal locked (insufficient constraints)": "约束模式解算：约束不足，焦距已锁定",
+    "Constrained solve: focal not updated": "约束模式解算：焦距未更新",
     "One-point strict: focal fixed": "单点透视(严格): 焦距保持不变",
 }

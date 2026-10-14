@@ -53,6 +53,41 @@ class CMP_PT_MainPanel(bpy.types.Panel):
         col.enabled = is_perspective
         col.operator("cmp.match_camera", text="Match Camera (Solve)", icon='CAMERA_DATA')
 
+        # 线条检查状态：常驻显示，任何时刻都能看到当前输入能不能用。
+        #   有异常       -> 红框 + NOT_FOUND 图标，逐行列出原因
+        #   解算过无异常 -> 绿勾 NODE_SOCKET_GEOMETRY
+        #   还没解算过   -> 中性提示（否则会把"没检查"误读成"检查通过"）
+        #
+        # scale_y 取 1.2 而不是 1.0：只有一行内容的 box 在深色主题下边框很淡、
+        # 高度又只有一行，实测用户会直接忽略掉这一块（"你说的框在哪？"）。
+        # 把行撑高一些，框的轮廓才看得见。
+        warning_text = getattr(cmp_data, "last_solve_warning", "")
+        solve_checked = bool(getattr(cmp_data, "last_solve_checked", False))
+        check_box = layout.box()
+        check_col = check_box.column(align=True)
+        check_col.scale_y = 1.2
+        if warning_text:
+            # alert 必须在**子项创建之前**设在真正承载子项的那个 layout 上。
+            # Blender 的 layout 只在创建子 layout/子控件的那一刻继承父级的
+            # alert 标志：check_box.alert 改的是 box 自己，而 check_col 是在它
+            # 之前就 column() 出来的、alert 仍是 False，所以 label 拿到的是
+            # 普通文字色 —— 实测截图里文字是 (79,89,104)（偏蓝的灰），一点红
+            # 都没有，就是这个原因。box 上也设一次，主题若支持会额外画描边。
+            check_box.alert = True
+            check_col.alert = True
+            # 提示用换行分隔（Blender 的 label 不自动换行，拼成一整条会被截断）
+            for part in [p.strip() for p in warning_text.split("\n") if p.strip()]:
+                # 用空操作符当"红底标签"。Blender 的 alert 对纯 label 不生效
+                # （实测同一 alert 容器里 label 文字始终是普通灰 (75,84,99)），
+                # 只对 button / prop 这类带 widget 的控件生效 —— 换成 button
+                # 后立刻拿到红底 (237,138,138) + 白字。所以这里挂
+                # cmp.line_check_row（点击无副作用的空操作符）当画布。
+                check_col.operator("cmp.line_check_row", text=part, icon='ERROR')
+        elif solve_checked:
+            check_col.label(text="Line check passed", icon='NODE_SOCKET_GEOMETRY')
+        else:
+            check_col.label(text="Not solved yet", icon='INFO')
+
         col.separator()
         col.separator()
         row = col.row()

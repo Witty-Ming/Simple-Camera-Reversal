@@ -275,6 +275,16 @@ def build_perspective_mode_constraints(lines_data, pixel_res_x, pixel_res_y, fin
         if primary_axis is None:
             primary_axis = max(('X', 'Y', 'Z'), key=lambda axis: counts.get(axis, 0))
 
+        # 单轴**不向 guided_lines_data 注入合成引导线**（只填 guided_axes 供显示层参考）。
+        #
+        # 合成引导线假设"另外两轴一水平一垂直"，该假设只在相机水平时成立；俯视/
+        # 仰视时完全错误。实测真值姿态 rotX=64.9°、只画 X 轴两条线时，注入的
+        # "Y 垂直 / Z 水平"会把解算拽到远离当前姿态的等价解上：相机被拉成水平
+        # （up_z 从 0.9055 掉到 -0.0162），画面整体变样，用户看到的就是"单轴匹配不上"。
+        #
+        # 改为只约束用户真正画的那一个轴，其余两个自由度由"离当前姿态最近的解"
+        # 决定——solve_camera_rotation_constrained 对没有法线的轴不做投影，SVD
+        # 正交化会尽量保留种子姿态，因此结果稳定地贴近用户画线前的视角。
         one_point_guides = {
             'X': {'Y': 'VERTICAL', 'Z': 'HORIZONTAL'},
             'Y': {'X': 'HORIZONTAL', 'Z': 'VERTICAL'},
@@ -283,8 +293,7 @@ def build_perspective_mode_constraints(lines_data, pixel_res_x, pixel_res_y, fin
         for axis in ('X', 'Y', 'Z'):
             if axis == primary_axis:
                 continue
-            orientation = one_point_guides.get(primary_axis, {}).get(axis, 'VERTICAL')
-            set_guided_axis(axis, orientation)
+            guided_axes[axis] = one_point_guides.get(primary_axis, {}).get(axis, 'VERTICAL')
 
     return {
         'mode': mode,
@@ -326,6 +335,119 @@ def solve_vanishing_points(lines_data, pixel_res_x, pixel_res_y):
             vp_data[axis] = vp
 
     return vp_data, axis_weights
+
+
+def compute_axis_consistency(lines_data, pixel_res_x, pixel_res_y, lines=None,
+                             principal_u=0.5, principal_v=0.5):
+    """检查每个轴的线段是否真能构成一组空间平行线（判断透视是否合乎物理）。
+
+    主判据是**留一法夹角**：用除某条线段之外的其他线段求消失点，再看这条线段
+    "指向该消失点"偏了多少度（= asin(垂距 / 中点到消失点的距离)）。理想情况下
+    所有线段都精确指向同一个消失点，夹角为 0；手工绘制误差带来几度；而画错的
+    线（例如本该沿 Y 轴却画成了沿 X 轴）会给出几十度。
+
+    **不要用"线段到消失点的垂距"当判据**（max_dist 字段仅为向后兼容保留）。
+    实测（1920x1080、三条 Y 轴长线、端点独立高斯噪声）：当两条线段在图像上
+    接近平行时，它们确定的消失点落在极远处，垂距对端点噪声的敏感度按
+    1/sin(夹角) 放大 —— ±8px 噪声下"好线"的垂距 p50 就有 98px、最大 1578px，
+    而"第三条线实际沿 X 轴"这种明显错误也才 989px，两者完全重叠、无法区分。
+    夹角判据把垂距除以"中点到消失点的距离"，正好抵消这个放大，同样条件下：
+      好线 ±8px：p50 4.2 度 / p90 9.7 度 / 最大 20.7 度
+      第三条偏离 20 度：76.8 度；偏离 45 度：47.9 度；偏离 90 度：42.7 度
+    因此取 30 度作阈值：±8px 这种极端手抖也不会误报，而明显画错的线一定触发。
+
+    留一法要求该轴至少 3 条线段（2 条线永远"精确"交于一点，无从判断一致性），
+    不足 3 条时 max_angle 为 None，调用方应视为"无法判断"而不是"有问题"。
+
+    返回 {axis: {'max_dist','mean_dist','max_angle','vp'} 或 None}。距离单位为
+    "以主点为原点的像素"，max_angle 单位为度。None 表示该轴线段不足 2 条或
+    消失点落在无穷远（线段彼此平行）。
+    """
+    report = {}
+    image_diag = max(float(np.hypot(pixel_res_x, pixel_res_y)), 1.0)
+    cx = pixel_res_x * principal_u
+    cy = pixel_res_y * principal_v
+
+    # 收集每条"会被 build_axis_line_data 接受"的线段中点（同样的 length >= 10
+    # 门槛），保证与 lines_data[axis] 里的条目逐条对应 —— 否则短线段被丢弃后
+    # 中点会整体错位，留一法就张冠李戴了。
+    mids_by_axis = {'X': [], 'Y': [], 'Z': []}
+    if lines is not None:
+        for line in lines:
+            axis = getattr(line, 'axis', None)
+            if axis not in mids_by_axis:
+                continue
+            try:
+                px1 = float(line.start[0]) * pixel_res_x - cx
+                py1 = float(line.start[1]) * pixel_res_y - cy
+                px2 = float(line.end[0]) * pixel_res_x - cx
+                py2 = float(line.end[1]) * pixel_res_y - cy
+            except Exception:
+                continue
+            if float(np.hypot(px2 - px1, py2 - py1)) < 10.0:
+                continue
+            mids_by_axis[axis].append(((px1 + px2) * 0.5, (py1 + py2) * 0.5))
+
+    for axis in ('X', 'Y', 'Z'):
+        data = lines_data.get(axis, [])
+        if len(data) < 2:
+            report[axis] = None
+            continue
+        try:
+            arr = np.array(data, dtype=float)
+        except Exception:
+            report[axis] = None
+            continue
+        if arr.ndim != 2 or arr.shape[0] < 2 or arr.shape[1] < 3:
+            report[axis] = None
+            continue
+        lines_abc = arr[:, :3]
+        weights = arr[:, 3] if arr.shape[1] >= 4 else np.ones(arr.shape[0])
+        if arr.shape[0] == 2:
+            weights = np.ones(2)
+        vp = solve_vanishing_point_2d(lines_abc, weights, image_diag=image_diag)
+        if vp is None:
+            report[axis] = None
+            continue
+        vp_h = np.array([float(vp[0]), float(vp[1]), 1.0])
+        # (a, b) 在 build_axis_line_data 里已归一化，因此 |a*x + b*y + c| 就是垂距
+        dists = np.abs(lines_abc @ vp_h)
+        if not np.all(np.isfinite(dists)):
+            report[axis] = None
+            continue
+
+        # 留一法夹角：逐条线段用"其余线段"求消失点，再量这条线段偏离该点的角度
+        max_angle = None
+        mids = mids_by_axis[axis]
+        if lines is not None and len(lines_abc) >= 3 and len(mids) == len(lines_abc):
+            worst_angle = 0.0
+            measured = False
+            for i in range(len(lines_abc)):
+                others = np.delete(lines_abc, i, axis=0)
+                vp_i = solve_vanishing_point_2d(
+                    others, np.ones(len(others)), image_diag=image_diag)
+                if vp_i is None:
+                    continue
+                vx, vy = float(vp_i[0]), float(vp_i[1])
+                d_i = abs(float(lines_abc[i][0]) * vx
+                          + float(lines_abc[i][1]) * vy
+                          + float(lines_abc[i][2]))
+                dist_i = float(np.hypot(mids[i][0] - vx, mids[i][1] - vy))
+                if not np.isfinite(dist_i) or dist_i < 1e-6:
+                    continue
+                ratio = min(1.0, max(0.0, d_i / dist_i))
+                worst_angle = max(worst_angle, float(np.degrees(np.arcsin(ratio))))
+                measured = True
+            if measured:
+                max_angle = float(worst_angle)
+
+        report[axis] = {
+            'max_dist': float(np.max(dists)),
+            'mean_dist': float(np.mean(dists)),
+            'max_angle': max_angle,
+            'vp': [float(vp[0]), float(vp[1])],
+        }
+    return report
 
 
 def compute_adjusted_horizon(vp_data, offset_px=0.0):
@@ -856,15 +978,23 @@ def register_class_safe(cls):
     try:
         bpy.utils.register_class(cls)
     except ValueError:
-        bpy.utils.unregister_class(cls)
+        # 已经注册过：先注销再注册，确保拿到的是最新实现。
+        # 这一步的失败必须显式打印，否则紧接着的 register_class 会抛出
+        # 让人看不懂的 "already registered"，或者更糟 —— 旧类残留，
+        # UI 里出现重复面板、旧操作符覆盖新实现。
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception as e:
+            print(f"[CameraMatch] 重新注册前注销类 {getattr(cls, '__name__', cls)} 失败: {e}")
         bpy.utils.register_class(cls)
 
 
 def unregister_class_safe(cls):
     try:
         bpy.utils.unregister_class(cls)
-    except Exception:
-        pass
+    except Exception as e:
+        # 静默吞掉会让"类没注销成功"变成无法诊断的问题。
+        print(f"[CameraMatch] 注销类 {getattr(cls, '__name__', cls)} 失败: {e}")
 
 
 def get_ordered_frame_points(context):
@@ -1011,8 +1141,18 @@ def solve_vanishing_point_2d(lines, weights=None, image_diag=2000.0):
     
     # 第三遍：精细求解
     vp_final = solve_weighted_svd(lines, robust_weights)
-    
-    return vp_final if vp_final is not None else vp
+    if vp_final is None:
+        vp_final = vp
+
+    # 与上面 n == 2 的分支保持一致：消失点远到 image_diag * 5 以外，说明这些线
+    # 其实近似平行，IRLS 只是把端点噪声"外推"成了一个极远的假交点。实测三条
+    # 近似平行的竖线能给出 1e5 像素以外的交点，而它随后会以"合法消失点"的身份
+    # 参与焦距解算，把焦距推向荒谬值。所以 n >= 3 也必须做同样的距离检查 ——
+    # 此前只有 n == 2 分支有，导致"三条近似平行线"反而比"两条"处置更宽松。
+    if np.linalg.norm(vp_final) > image_diag * 5:
+        return None
+
+    return vp_final
     
 # ... (omitted)
 
@@ -1166,7 +1306,15 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
              return None
              
         d = np.dot(v1, v2)
-        if d < 0: return np.sqrt(-d)
+        if d < 0:
+            f_px = float(np.sqrt(-d))
+            # 两个消失点几乎正交时 d ≈ 0⁻，sqrt(-d) 会给出接近 0 的像素焦距，
+            # 而它随后会作为除数出现在射线构造里（ray = [px, py, -f_px] 归一化、
+            # 位置 = ray * dist 等），直接把位置炸成 inf/nan。这个值在物理上
+            # 也不可能（f_px → 0 对应无穷视场角），判为"这对消失点给不出焦距"。
+            if not np.isfinite(f_px) or f_px < 1e-6:
+                return None
+            return f_px
         return None
     
     def validate_focal_length(f_pixels, pixel_width, pixel_height):
@@ -1181,9 +1329,18 @@ def calculate_camera_transform(vp_data, sensor_width_mm, sensor_height_mm, senso
         if f_pixels is None or not np.isfinite(f_pixels) or f_pixels <= 0:
             return False
 
-        # 一般相机焦距 10~300mm，对应像素焦距约为图像高度的 0.3~20 倍
-        min_f = pixel_height * 0.3
-        max_f = pixel_height * 20.0
+        # 范围必须按"较长边"定标，而不是固定用 pixel_height —— AUTO 传感器适配
+        # 就是用较长边把毫米焦距换算成像素焦距的（见 get_effective_f_pixels），
+        # 所以同一个镜头在横竖构图下 pixel_height 会差一倍，拿它当尺子会让横构图
+        # 的合法区间整体缩水一半（1920x1080 下 0.3*pixel_height 相当于 6.1mm，
+        # 而竖构图 1080x1920 下同样的镜头得到的是 10.8mm 的下限）。
+        #
+        # 系数含义：f_px / longer = f_mm / sensor_width，取 sensor_width = 36mm，
+        # 于是 0.2 ~ 12 对应约 7mm ~ 430mm 的镜头，覆盖从超广角到长焦的常用区间，
+        # 又足以拦住 sqrt(-d) 在消失点近正交时冒出来的荒谬小值。
+        longer = max(float(pixel_width), float(pixel_height))
+        min_f = longer * 0.2
+        max_f = longer * 12.0
         return min_f <= f_pixels <= max_f
 
     def focal_consistency_confidence(f_std, f_mean):
@@ -1415,8 +1572,12 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix, 
             if np.isfinite(sum_length) and sum_length > 1e-8:
                 normals[axis] = sum_n / sum_length
             
-    if len(normals) < 2:
-        return None # 需要至少 2 个轴
+    # 至少 1 个轴即可解算。单轴（单点透视）时只有该轴被投影约束，其余两列保持
+    # 种子方向、仅由末尾的 SVD 正交化做最小修正，因此解稳定地落在"离当前姿态
+    # 最近"的那个解上，不会漂到画面完全变样的等价解（见 build_perspective_mode_constraints
+    # 里 ONE_POINT 分支的说明）。
+    if len(normals) < 1:
+        return None # 一个轴都没有时无从约束
         
     # 2. 优化
     # 我们希望 R = [rx, ry, rz] 使得 rx 垂直 Nx, ry 垂直 Ny, rz 垂直 Nz
@@ -1425,38 +1586,95 @@ def solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix, 
     R_seed = R.copy()
     # 确保正交仅防万一
     R = orthonormalize_matrix(R) 
-    
-    # 迭代投影
-    for i in range(iterations):
-        # 1. 投影列到平面
-        u, v, w = R[:, 0], R[:, 1], R[:, 2]
+
+    # 单轴（单点透视）走解析解，不做下面的交替投影迭代。
+    #
+    # 为什么：迭代体每轮只把被约束的那一列投影到约束平面，其余两列原样带入
+    # orthonormalize_matrix 做 SVD 正交化；而 SVD 找的是"与 [u_proj, v0, w0] 的
+    # Frobenius 距离最小的旋转矩阵"，为了让三列重新正交，它会顺带把未被约束的
+    # v、w 也转走一点 —— 每轮转一点，20 轮累积下来姿态可以偏离种子很远。
+    # 实测用户工程（I:\空净\T90\首图2.blend，4096x4096）只画 3 条 X 轴线段时：
+    # 相机 up_z 从 0.96945 被转到 0.24294（约 70 度），而正确解应当停在 0.9686
+    # 附近。这个被转歪的姿态又会成为下一次解算的种子，于是用户每画一条线画面就
+    # 歪一次，后续即使补上 Y 轴线段也从坏种子出发收敛到别的局部极小 ——
+    # 正是用户报告的"单轴、多轴都会出现匹配不上"的来源。
+    #
+    # 最小旋转的做法：把种子里被约束的那一列投影到约束平面，再用"把该列转到
+    # 投影方向"的那一次最小旋转作用于整个种子姿态。这样约束被严格满足
+    # （R[:, idx] 恰为投影方向），另外两列只跟着这一次必要的旋转走，不引入任何
+    # 多余转动。投影退化为零向量（视线与法线平行、该轴没有可见的消失点方向）时
+    # 保持种子不变。
+    if len(normals) == 1:
+        axis_name = next(iter(normals))
+        n_single = normals[axis_name]
+        idx = {'X': 0, 'Y': 1, 'Z': 2}[axis_name]
+        base_col = R_seed[:, idx].copy()
+        proj = base_col - np.dot(base_col, n_single) * n_single
+        proj_norm = float(np.linalg.norm(proj))
+        if np.isfinite(proj_norm) and proj_norm > 1e-6:
+            proj = proj / proj_norm
+            cross = np.cross(base_col, proj)
+            sin_a = float(np.linalg.norm(cross))
+            cos_a = float(np.dot(base_col, proj))
+            if sin_a > 1e-9:
+                kx = np.array([[0.0, -cross[2], cross[1]],
+                               [cross[2], 0.0, -cross[0]],
+                               [-cross[1], cross[0], 0.0]])
+                rot_min = np.eye(3) + kx + kx @ kx * ((1.0 - cos_a) / (sin_a * sin_a))
+                R = orthonormalize_matrix(rot_min @ R_seed)
+        else:
+            R = R_seed.copy()
+    else:
+        # 迭代投影（两个及以上轴时约束足够，交替投影收敛到唯一解）
+        for i in range(iterations):
+            # 1. 投影列到平面
+            u, v, w = R[:, 0], R[:, 1], R[:, 2]
+            
+            if 'X' in normals:
+                n = normals['X']
+                u = u - np.dot(u, n) * n
+                if np.linalg.norm(u) > 1e-6: u /= np.linalg.norm(u)
+                
+            if 'Y' in normals:
+                n = normals['Y']
+                v = v - np.dot(v, n) * n
+                if np.linalg.norm(v) > 1e-6: v /= np.linalg.norm(v)
+                
+            if 'Z' in normals:
+                n = normals['Z']
+                w = w - np.dot(w, n) * n
+                if np.linalg.norm(w) > 1e-6: w /= np.linalg.norm(w)
+                
+            # 2. 正交化 (SVD)
+            R_new = np.column_stack((u, v, w))
+            R = orthonormalize_matrix(R_new)
         
-        if 'X' in normals:
-            n = normals['X']
-            u = u - np.dot(u, n) * n
-            if np.linalg.norm(u) > 1e-6: u /= np.linalg.norm(u)
-            
-        if 'Y' in normals:
-            n = normals['Y']
-            v = v - np.dot(v, n) * n
-            if np.linalg.norm(v) > 1e-6: v /= np.linalg.norm(v)
-            
-        if 'Z' in normals:
-            n = normals['Z']
-            w = w - np.dot(w, n) * n
-            if np.linalg.norm(w) > 1e-6: w /= np.linalg.norm(w)
-            
-        # 2. 正交化 (SVD)
-        R_new = np.column_stack((u, v, w))
-        R = orthonormalize_matrix(R_new)
-        
-    # 3. 离散二义性消除：迭代投影从种子出发，收敛解与种子同向；
-    #    仅在"翻转世界 Y/Z（绕视轴转180°）"与收敛解之间选择更接近种子的那个，
-    #    避免无脑"世界 Z 朝上"翻转把俯视相机的俯仰错误扭转。
+    # 3. 离散二义性消除。
+    #    迭代投影的残差对 R 与 R_flip（世界 Y/Z 两列同时取反，等价于绕视轴转 180°）
+    #    完全相同 —— 翻转不改变任何轴的约束方向，所以残差根本无法区分二者，
+    #    符号只能由种子（迭代起点）决定。
+    #    旧实现只在两者中选"与种子更接近"的那个；于是当种子本身是倒的
+    #    （用户手动把相机转倒、上一次解算遗留、相机初始姿态很怪）时，
+    #    解出来的相机就是倒的 —— 这正是用户报告的"绘制后 Z 轴反了、产品整个倒过来"。
+    #    实测（合成场景 5 个视角，th = 23/38/84/101/125 度）：真值 up_z 全部为正
+    #    （0.3907 / 0.6157 / 0.9945 / 0.9816 / 0.8192）；而用 Matrix.Identity(3)
+    #    当种子时 top_down 给出 up_z = -0.0114、bottom_up 给出 0.033、
+    #    steep 给出 0.1021 —— 坏种子确实会把相机翻倒。
+    #    因此改为：只要二者符号不同，一律取 up_z >= 0 的那个（相机不会倒置拍摄，
+    #    这是稳定的物理先验；俯拍 th=23 度与仰拍 th=125 度时 up_z 依然为正，不受影响）；
+    #    只有二者同号（含 up_z ≈ 0 的水平视线情形）才回退到"与种子更接近"。
+    #    up_z = R[1, 2]：R 是 World->Cam，其转置的第 1 列即相机 up 在世界中的方向，
+    #    该向量的世界 Z 分量就是转置矩阵的 [2, 1] 元素，也就是 R 的 [1, 2] 元素。
     R_flip = R.copy()
     R_flip[:, 1] = -R_flip[:, 1]
     R_flip[:, 2] = -R_flip[:, 2]
-    if float(np.sum(R_flip * R_seed)) > float(np.sum(R * R_seed)):
+    up_z = float(R[1, 2])
+    flip_up_z = float(R_flip[1, 2])
+    if up_z < 0.0 <= flip_up_z:
+        R = R_flip
+    elif up_z >= 0.0 > flip_up_z:
+        pass
+    elif float(np.sum(R_flip * R_seed)) > float(np.sum(R * R_seed)):
         R = R_flip
 
     # 作为 Blender 矩阵返回 (Cam->World)
@@ -1475,7 +1693,20 @@ def solve_strict_mode_constrained(
     current_rot_matrix,
     allow_focal_refine=True,
     fast=False,
+    smooth_ref_mm=None,
+    extra_seeds=None,
+    multistart_random=0,
 ):
+    """
+    :param smooth_ref_mm: 焦距正则化的参考值（跨帧时间平滑基准）。实时解算时
+        传入相机**当前**焦距，让"向参考值正则化"真正起到平滑作用；为 None 时
+        退化为以扫描中心 current_f_mm 为基准。扫描中心始终是 current_f_mm，
+        因此参考值偏离真值也不会让扫描错过解。
+    :param extra_seeds: 除 current_rot_matrix 之外的额外旋转起点（例如消失点法
+        给出的姿态）。交替投影只做局部收敛，起点越多越不容易卡在错误的局部极小。
+    :param multistart_random: 额外生成多少个随机姿态起点。0 表示关闭（只精化
+        给定的起点），非零时由调用方按 fast/exact 决定数量以控制开销。
+    """
     f_seed = float(max(current_f_mm, 1e-6))
 
     if allow_focal_refine:
@@ -1489,14 +1720,24 @@ def solve_strict_mode_constrained(
             pixel_height,
             current_rot_matrix,
             fast=fast,
+            smooth_ref_mm=smooth_ref_mm,
+            extra_seeds=extra_seeds,
+            multistart_random=(max(2, int(multistart_random) // 4) if multistart_random else 0),
         )
 
         if refinement.get('reliable', False):
             f_mm = float(refinement.get('f_mm', f_seed))
             focal_state = 'refined'
         else:
-            f_mm = f_seed
-            focal_state = 'locked'
+            # 焦距锁定：采用 refine 给出的保守值（相机当前焦距），而不是消失点给的
+            # f_seed。f_seed 在噪声下可能离谱到 +131%，"锁定"却锁在错误值上 ——
+            # 实测 bottom_up/YZ/n8/s2 因此把焦距误差从 42.9%（保持相机初值）恶化到
+            # 82.9%。refine 在不可靠时会返回 smooth_ref（调用方未提供时才是 f_seed）。
+            f_mm = float(refinement.get('f_mm', f_seed))
+            # 再细分：refine 报不可靠，但残差比较显示它采用的正是"消失点给出的
+            # 焦距"（state='consistent'）时，焦距其实已经正确、无需改变，不应报
+            # "约束不足/已锁定"。只有真正退回相机当前焦距时才报 locked。
+            focal_state = 'consistent' if refinement.get('state') == 'consistent' else 'locked'
     else:
         refinement = {
             'f_mm': float(f_seed),
@@ -1525,7 +1766,42 @@ def solve_strict_mode_constrained(
             'residual': float('inf'),
         }
 
-    rot_matrix = solve_camera_rotation_constrained(lines_data, f_pixels, current_rot_matrix)
+    # 多起点求解：交替投影只做局部收敛 —— 实测从"相机当前姿态"出发会卡在残差
+    # 0.1441 的局部极小（把相机解成仰视 29.6 度、整体歪掉），而多起点能找到
+    # 0.0238 的解（俯视 12.4 度、up_z=0.977）。用户看到的"画面是歪的""Z 轴
+    # 不指向空间方向"都源于姿态卡在错误的局部极小上，因此这里必须多起点。
+    # 但**单轴时必须关掉多起点**：只有一个轴向有线段时，约束只剩"把该轴列投影到
+    # 法线平面"，精化后任何起点的残差都恰好是 0，而 solve_rotation_multistart 里
+    # 用 `residual < best_residual` 严格比较，于是取粗筛排第一的那个。粗筛排第一的
+    # 是"种子自身残差最小"的**随机**姿态，它另外两个自由度完全随机 —— 实测用户
+    # 工程只画 1 条 X 线时 up_z 从 0.96945 掉到 0.24294（相机被凭空转了 60 多度）、
+    # 画到 3 条 X 线时是 0.23827；且 cold（每步重置相机）与 warm 结果完全相同，
+    # 说明与状态累积无关，就是多起点选错了起点。单轴唯一合理解是"离当前姿态最近
+    # 的那个"（最小旋转解析解），所以只精化当前姿态、不生成随机起点。
+    active_axis_count = sum(1 for axis in ('X', 'Y', 'Z') if lines_data.get(axis))
+    final_seeds = [np.array(current_rot_matrix, dtype=float)]
+    if active_axis_count <= 1:
+        random_seed_count = 0
+        keep_seeds = 1
+    else:
+        for seed in (extra_seeds or []):
+            if seed is None:
+                continue
+            try:
+                final_seeds.append(np.array(seed, dtype=float))
+            except Exception:
+                continue
+        random_seed_count = int(multistart_random)
+        keep_seeds = 2 if fast else 4
+
+    rot_matrix, _final_residual = solve_rotation_multistart(
+        lines_data,
+        f_pixels,
+        final_seeds,
+        iterations=20,
+        extra_random=random_seed_count,
+        keep=keep_seeds,
+    )
     if rot_matrix is None:
         return {
             'ok': False,
@@ -1591,6 +1867,147 @@ def compute_rotation_constraint_residual(lines_data, rot_matrix, f_pixels):
     return total_error / total_weight
 
 
+# 非锚点起点（消失点法姿态、随机姿态）的解被采纳所需的"相对锚点残差改善"门槛。
+#
+# 多起点是"盲搜"：候选起点先用自身残差粗筛，再迭代精化，最后取残差最小者。
+# 在端点噪声下这会过拟合 —— 别的起点可能恰好让"消失点落在各自线段上"这个残差
+# 略小，方向却完全错误。实测俯视 65 度、每轴 3 条线、±8px 端点噪声：
+#   · 只精化锚点（相机当前姿态）：残差 0.0664、整体旋转误差 6.1 度（正确）
+#   · 加入消失点法姿态后：残差 0.0523（仅改善 21%）、旋转误差 82.2 度（错误）
+#   · 加入 24 个随机起点后：残差 0.0724、旋转误差 98.2 度（错误）
+# 反过来，真正卡在错误局部极小的场景改善极其显著：用户工程
+# I:\空净\T90\首图2.blend 从锚点出发残差 0.1441，多起点找到 0.0238（改善 83%）。
+# 取 0.4 作为门槛可把"改善 20% 的假解"与"改善 80% 的真解"干净分开。
+#
+# 注意：门槛只对**非锚点**起点生效。锚点是调用方给的"相机当前姿态"，它本身
+# 永远是合法候选（用户手动摆好的视角不该被盲搜随手推翻）。
+MULTISTART_ADOPT_MARGIN = 0.4
+
+
+def solve_rotation_multistart(
+    lines_data,
+    f_pixels,
+    seeds=None,
+    iterations=20,
+    extra_random=0,
+    keep=4,
+    rng=None,
+):
+    """多起点求解相机旋转，返回约束残差最小的解。
+
+    solve_camera_rotation_constrained 是交替投影迭代，**只做局部收敛**：同一组
+    线条从不同起点出发会落到不同的不动点，残差能差好几倍。实测用户的实际工程
+    （I:\\空净\\T90\\首图2.blend，4096x4096，X/Y/Z 各 3 条线）：从"相机当前姿态"
+    出发残差 0.1441（等效 8.3 度角度误差，相机被解成**仰视 29.6 度**），而从其他
+    起点出发能找到 0.0238（1.37 度，**俯视 12.4 度**）—— 相差 6 倍。姿态错了整个
+    画面的方向就都错了（用户看到的"Z 轴不指向空间方向""画面是歪的"），所以必须
+    做多起点，不能只从当前姿态出发。
+
+    做法：候选起点先用"种子自身的残差"粗筛（不迭代，非常便宜），只对最优的
+    keep 个做迭代精化，最后取残差最小的解。这样既覆盖了残差的多峰结构，又不会
+    让开销随起点数线性增长。
+
+    :param seeds: 候选起点（Cam->World 3x3，mathutils.Matrix 或 numpy 数组均可）
+    :param extra_random: 额外生成多少个随机姿态起点（用固定 rng 保证可复现）
+    :param keep: 粗筛后真正做迭代精化的起点个数
+    :param rng: 可选的 numpy Generator；为 None 时用固定种子新建，保证可复现
+    """
+    candidates = []
+    for seed in (seeds or []):
+        if seed is None:
+            continue
+        try:
+            m = np.array(seed, dtype=float)
+        except Exception:
+            continue
+        if m.shape == (3, 3) and np.all(np.isfinite(m)):
+            candidates.append(m)
+
+    # 显式种子（调用方给的：通常是"相机当前姿态"，可能还有消失点法姿态）与
+    # 随机种子要分开记账 —— 前者可信，后者只是盲搜，采纳门槛不同。
+    explicit_count = len(candidates)
+
+    if extra_random > 0:
+        rng_local = rng if rng is not None else np.random.default_rng(20260214)
+        for _ in range(int(extra_random)):
+            q = rng_local.normal(size=4)
+            q_norm = float(np.linalg.norm(q))
+            if not np.isfinite(q_norm) or q_norm <= 1e-9:
+                continue
+            qw, qx, qy, qz = (q / q_norm).tolist()
+            candidates.append(np.array([
+                [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+                [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+                [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+            ]))
+
+    if not candidates:
+        return None, float('inf')
+
+    scored = []
+    for index, candidate in enumerate(candidates):
+        try:
+            seed_residual = compute_rotation_constraint_residual(
+                lines_data, mathutils.Matrix(candidate), f_pixels)
+        except Exception:
+            continue
+        if np.isfinite(seed_residual):
+            scored.append((float(seed_residual), index, candidate))
+
+    if not scored:
+        return None, float('inf')
+
+    scored.sort(key=lambda item: item[0])
+    keep_n = max(1, min(int(keep), len(scored)))
+    chosen = list(scored[:keep_n])
+
+    # 锚点（第一个显式种子）必须参与精化：它是盲搜解的"参照基准"，如果粗筛把它
+    # 挤掉，下面的采纳门槛就失效了（anchor_residual 停在 inf）。
+    if explicit_count > 0 and not any(item[1] == 0 for item in chosen):
+        anchor_entry = next((item for item in scored if item[1] == 0), None)
+        if anchor_entry is not None:
+            chosen.append(anchor_entry)
+
+    # 锚点（第一个显式种子，即调用方给的"相机当前姿态"）必须**先**精化：它的结果
+    # 是下面所有非锚点起点的采纳基准。若把它和其他起点混在同一个循环里，处理到
+    # 非锚点起点时 anchor_residual 可能还是 inf，门槛就形同虚设 —— 实测过这个坑：
+    # 粗筛把锚点挤出前 keep 名、锚点被追加到 chosen 末尾，于是 hybrid 姿态（残差
+    # 0.0523、旋转误差 82.2 度）在基准就绪前就被采纳了。
+    anchor_rot = None
+    anchor_residual = float('inf')
+    anchor_entry = next((item for item in scored if item[1] == 0), None)
+    if anchor_entry is not None:
+        rot = solve_camera_rotation_constrained(
+            lines_data, f_pixels, mathutils.Matrix(anchor_entry[2]), iterations=iterations)
+        if rot is not None:
+            residual = compute_rotation_constraint_residual(lines_data, rot, f_pixels)
+            if np.isfinite(residual):
+                anchor_rot = rot
+                anchor_residual = float(residual)
+
+    best_rot = anchor_rot
+    best_residual = anchor_residual
+    for _seed_residual, index, candidate in chosen:
+        if index == 0:
+            continue
+        rot = solve_camera_rotation_constrained(
+            lines_data, f_pixels, mathutils.Matrix(candidate), iterations=iterations)
+        if rot is None:
+            continue
+        residual = compute_rotation_constraint_residual(lines_data, rot, f_pixels)
+        if not np.isfinite(residual):
+            continue
+        # 非锚点起点的解，只有相对锚点改善超过 MULTISTART_ADOPT_MARGIN 才采纳，
+        # 见该常量的注释。
+        if np.isfinite(anchor_residual) and residual > anchor_residual * (1.0 - MULTISTART_ADOPT_MARGIN):
+            continue
+        if residual < best_residual:
+            best_residual = float(residual)
+            best_rot = rot
+
+    return best_rot, best_residual
+
+
 def refine_focal_length_for_constrained_rotation(
     lines_data,
     current_f_mm,
@@ -1601,6 +2018,9 @@ def refine_focal_length_for_constrained_rotation(
     pixel_height,
     current_rot_matrix,
     fast=False,
+    smooth_ref_mm=None,
+    extra_seeds=None,
+    multistart_random=0,
 ):
     active_axes = [axis for axis in ('X', 'Y', 'Z') if len(lines_data.get(axis, [])) >= 1]
     if len(active_axes) < 2:
@@ -1611,18 +2031,139 @@ def refine_focal_length_for_constrained_rotation(
             'best_residual': float('inf'),
         }
 
+    # 焦距可辨识性门槛：每个消失点至少要 2 条同轴线段才能定义，而焦距由两个
+    # 正交轴的消失点共同决定（f² = -V1·V2）。所以"能出消失点的轴"少于 2 个时，
+    # 焦距在数学上完全不可辨识，此时**必须完全不碰焦距**。
+    #
+    # 实测（用户工程 I:\空净\IN19\4.blend：X 1 条 + Y 3 条 + Z 1 条，只有 Y 轴
+    # 能出消失点）：固定姿态下扫描焦距 10/20/30/40/50/60/80/100/150/200/257/
+    # 350/500/800/1500mm，残差为 0.1802/0.1112/0.0829/0.0678/0.0586/0.0523/
+    # 0.0444/0.0397/0.0333/0.0301/0.0279/0.0260/0.0245/0.0231/0.0220 —— 单调
+    # 下降、**没有谷底**，焦距越大残差越小（每换一次姿态重解也一样单调）。
+    # 任何"残差有改善"的判据在这种曲线上都必然把焦距推向扫描上限；而扫描范围
+    # 是 current_f × geomspace(0.15, 3.0)，上限随 current_f 一起涨，逐帧累积就是
+    # 用户看到的"焦距无限变大"（实时档 6%/帧限幅下 28Hz 一秒能涨 5 倍）。一旦
+    # 最优落回扫描边界，at_edge 又把它判成不可靠而锁死 —— 于是出现"涨一阵、
+    # 卡一阵"，也就是用户说的"数值很大时锁死，要调很久才变化"。
+    #
+    # 正确行为：只有 1 个轴可定义消失点时，焦距交给用户/相机原值，插件只用约束
+    # 法解姿态（约束法对焦距误差几乎免疫：实测传 13.71mm / 109.99mm 这种完全
+    # 错误的焦距，姿态误差也只到 2.47°）。
+    vp_capable_axes = [axis for axis in ('X', 'Y', 'Z') if len(lines_data.get(axis, [])) >= 2]
+    if len(vp_capable_axes) < 2:
+        return {
+            'f_mm': float(current_f_mm),
+            'reliable': False,
+            'baseline_residual': float('inf'),
+            'best_residual': float('inf'),
+            'identifiable': False,
+        }
+
     current_f = max(float(current_f_mm), 1e-6)
-    # 性能：扫描阶段只需要"排序"候选，用较少的迭代投影次数即可；最终解仍用
-    # 20 次。fast=True 用于绘制/拖拽过程中的实时解算，进一步降低密度。
-    scan_iterations = 6 if fast else 8
+
+    # 多起点种子池：在函数入口生成一次，所有焦距候选复用。
+    #
+    # 种子是"姿态"，与焦距无关（只有粗筛排序会随 f_pixels 变化），所以池子可以
+    # 共享。反过来，若每个 score_candidate 各自临时生成随机种子，就会陷入两难：
+    # 生成多了总开销乘以几十次调用、生成少了又找不到真解 —— 实测只给 6 个随机
+    # 种子时，真值焦距处的残差都降不到 0，于是 strong_evidence 判据
+    # （最优残差 < 基线一半）不触发、"最优焦距"落回基线，焦距完全不动
+    # （无噪声、真值 35mm、初值 50mm 时 5/5 例误差 42.86%）。
+    #
+    # 池子大小按 fast/exact 分档，直接乘进总开销（score_candidate 会被调用约
+    # 40 次），因此精确档 24 个、实时档 8 个。
+    seed_pool = []
+    try:
+        seed_pool.append(np.array(current_rot_matrix, dtype=float))
+    except Exception:
+        pass
+    for extra_seed in (extra_seeds or []):
+        if extra_seed is None:
+            continue
+        try:
+            seed_pool.append(np.array(extra_seed, dtype=float))
+        except Exception:
+            continue
+    pool_rng = np.random.default_rng(20260214)
+    for _ in range(3 if fast else 4):
+        q = pool_rng.normal(size=4)
+        q_norm = float(np.linalg.norm(q))
+        if not np.isfinite(q_norm) or q_norm <= 1e-9:
+            continue
+        qw, qx, qy, qz = (q / q_norm).tolist()
+        seed_pool.append(np.array([
+            [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)],
+            [2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)],
+            [2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)],
+        ]))
+
+    # 固定入选集合：在函数入口用**扫描中心** current_f 对种子池粗筛一次，之后所有
+    # 焦距候选共用同一批起点（当前相机姿态永远入选）。
+    #
+    # 若让每个 score_candidate 各自对池子排序，入选集合会随 f_pixels 变化 —— 焦距
+    # 微变就可能换掉一个起点，残差曲线随之跳变，表现为焦距抖动（实测旧实现下焦距
+    # 对初值的离散度 1.696mm，是 1.2.0 的 2.9 倍）。固定集合还省掉了每轮粗筛的
+    # 开销（旧实现每个候选都要对池子里所有种子各算一次残差）。
+    fixed_seeds = []
+    try:
+        f_pixels_seed = get_effective_f_pixels(
+            current_f, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height)
+        if np.isfinite(f_pixels_seed) and f_pixels_seed > 1e-8:
+            seed_scored = []
+            for _idx, _seed in enumerate(seed_pool):
+                _res = compute_rotation_constraint_residual(lines_data, _seed, f_pixels_seed)
+                if np.isfinite(_res):
+                    seed_scored.append((float(_res), _idx))
+            seed_scored.sort()
+            keep_seeds = 2 if fast else 3
+            picked = [_idx for _res, _idx in seed_scored]
+            if 0 in picked:
+                picked.remove(0)
+            picked = [0] + picked[: max(0, keep_seeds - 1)]
+            fixed_seeds = [seed_pool[_idx] for _idx in picked]
+    except Exception:
+        fixed_seeds = []
+    if not fixed_seeds:
+        fixed_seeds = list(seed_pool)
+
+    # 扫描阶段的迭代投影次数（与 1.2.0 一致取 12）。手工绘制的线段不可能精确交于
+    # 同一消失点，迭代不足会让旋转解算的残差带上噪声，而焦距正是靠"比较不同
+    # 候选的残差"选出来的，噪声会直接表现为焦距抖动。开销改用粗扫点数与局部
+    # 精化步数去省，而不是牺牲迭代精度。
+    scan_iterations = 12
     coarse_count = 7 if fast else 12
     fine_count = 5 if fast else 9
     # 局部精化只比较相对优劣，迭代次数可以再降一档
     local_iterations = max(4, scan_iterations - 4)
-    refine_steps = 3 if fast else 6
+    # 实时模式只对最优的 1 个候选做 2 步三分搜索：三分搜索在残差多峰时会随
+    # 线条抖动跳到不同局部极小，是拖拽中"画面忽大忽小"的来源之一；但完全跳过
+    # 又会让精度停在离散细扫的格点间隔上（实时档约 4.8%，肉眼可见）。
+    refine_candidates = 1
+    refine_steps = 2 if fast else 5
 
-    def score_candidate(f_candidate, iterations=None):
-        """对单个焦距候选打分：线长加权残差 + 轻微偏离起点惩罚。"""
+    # "向扫描中心正则化"的强度，用来压住手工绘制误差造成的抖动。
+    #
+    # 参照系是**扫描中心 current_f**（消失点法给出的焦距），与 1.2.0 一致。
+    # 曾经把它改成"相机当前焦距 smooth_ref"，本意是做时间平滑，结果适得其反：
+    # 惩罚项在"相机焦距已接近真值"时恒为 0，等于把候选钉死在现状，用户看到的
+    # 就是"焦距不会变化了"（实测用户工程 50mm→45mm 的残差改善 0.0045 被 0.05
+    # 的惩罚 0.0052 吃掉，总分排序把 50mm 选回来）。
+    #
+    # 权重也回到 1.2.0 的 0.008。实测（用户工程 I:\空净\T90\首图2.blend，
+    # 4096x4096、6 条线 X/Y 各 3）：权重 0.012/0.025 时焦距对初值的敏感度
+    # （初值 20/35/50/85/135 的离散度）是 1.696mm、单次约 105ms；1.2.0
+    # （权重 0.008、单起点、12 次迭代）离散度 0.587mm、约 21ms。
+    proximity_weight = 0.008
+    smooth_ref = float(smooth_ref_mm) if smooth_ref_mm is not None else current_f
+    if not np.isfinite(smooth_ref) or smooth_ref <= 1e-6:
+        smooth_ref = current_f
+
+    def score_candidate(f_candidate, iterations=None, seed=None):
+        """对单个焦距候选打分：线长加权残差 + 轻微偏离扫描中心惩罚。
+
+        seed 非空时用它当**唯一起点**（warm start）：相邻焦距的最优姿态相差不到
+        0.5°，从上一个候选的姿态出发比"每个候选都从头多起点搜"又快又准。
+        """
         iters = scan_iterations if iterations is None else iterations
         f_candidate = float(np.clip(f_candidate, 8.0, 2000.0))
         f_pixels = get_effective_f_pixels(
@@ -1636,8 +2177,23 @@ def refine_focal_length_for_constrained_rotation(
         if not np.isfinite(f_pixels) or f_pixels <= 1e-8:
             return None
 
-        rot_candidate = solve_camera_rotation_constrained(
-            lines_data, f_pixels, current_rot_matrix, iterations=iters)
+        # 粗扫必须多起点：焦距是"比较不同候选的残差"选出来的，若某个候选的旋转
+        # 卡在局部极小，它的残差会被系统性抬高、谷底位置随之偏掉。实测用户的
+        # 工程里，单起点扫描给出的是单调下降的曲线（没有谷底、根本无法定焦距），
+        # 多起点扫描才有明确谷底（45mm 处 79.5，两侧 16mm→458、180mm→241）。
+        # 起点集合在函数入口已固定（fixed_seeds），不随候选焦距重排序。
+        if seed is not None:
+            rot_candidate = solve_camera_rotation_constrained(
+                lines_data, f_pixels, seed, iterations=iters)
+        else:
+            rot_candidate, _cand_residual = solve_rotation_multistart(
+                lines_data,
+                f_pixels,
+                fixed_seeds,
+                iterations=iters,
+                extra_random=0,
+                keep=len(fixed_seeds),
+            )
         if rot_candidate is None:
             return None
 
@@ -1645,13 +2201,13 @@ def refine_focal_length_for_constrained_rotation(
         if not np.isfinite(residual):
             return None
 
-        proximity_penalty = 0.008 * abs(math.log(max(f_candidate, 1e-6) / current_f))
+        proximity_penalty = proximity_weight * abs(math.log(max(f_candidate, 1e-6) / current_f))
         return (residual + proximity_penalty, residual, f_candidate, rot_candidate)
 
-    def scan_factors(factors):
+    def scan_factors(factors, iterations=None, seed=None):
         scored = []
         for factor in factors:
-            item = score_candidate(current_f * factor)
+            item = score_candidate(current_f * factor, iterations=iterations, seed=seed)
             if item is None:
                 continue
             if any(abs(item[2] - prev) < 1e-6 for prev, *_ in scored):
@@ -1665,20 +2221,38 @@ def refine_focal_length_for_constrained_rotation(
     # 线性 12 点里最接近的是 29.75 与 44.8，扫描彻底错过真值并收敛到 37.2）。
     # 范围取 0.15x~3.0x，可覆盖初始值与真值相差约 6 倍的情形；粗网格的精度
     # 由后面的细扫与三分搜索补回来。
+    # 粗扫只需要把最优区间定位到"细扫的 ±12% 窗口内"，用局部精化的迭代次数就够；
+    # 实测粗扫用 8 次与 4 次迭代选出的是同一个区间，但前者在 12 个粗扫点上要多花
+    # 一倍时间（每次 score_candidate 都要对种子池里 10 个起点各跑一遍迭代）。
     coarse_factors = np.geomspace(0.15, 3.0, coarse_count)
-    scored = scan_factors(coarse_factors)
+    scored = scan_factors(coarse_factors, iterations=local_iterations)
 
-    # 始终把当前焦距纳入候选（作为残差比较的基线）
-    if not any(abs(item[2] - current_f) < 1e-6 for item in scored):
+    # 始终把"扫描中心 current_f"与"正则参考 smooth_ref"都纳入候选。
+    # current_f 是消失点法给出的焦距，可能离谱（实测能偏 +131%）；smooth_ref
+    # 是相机当前焦距，是独立于消失点估计的先验。两者都进候选，下面的基线比较
+    # 才有一个"保守答案"可比 —— 若扫描结果连相机初值都赢不了，就不该改焦距。
+    #
+    # 注意：加入时必须和 score_candidate 用同一套打分（含 proximity penalty）。
+    # 只放纯残差会让 current_f 永远占便宜 —— 实测 level_side 视角 ±8px 噪声下，
+    # current_f=80.7083mm 的纯残差 0.022425 小于扫描最优点 47.25mm 的总分
+    # 0.02401，于是"最优"永远是 current_f 自己，离谱的消失点焦距被原样保留
+    # （实测 130.6% 的焦距误差正是这么来的）。
+    for f_base in (current_f, smooth_ref):
+        if any(abs(item[2] - f_base) < 1e-6 for item in scored):
+            continue
         f_pixels0 = get_effective_f_pixels(
-            current_f, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height)
-        if np.isfinite(f_pixels0) and f_pixels0 > 1e-8:
-            rot0 = solve_camera_rotation_constrained(
-                lines_data, f_pixels0, current_rot_matrix, iterations=scan_iterations)
-            if rot0 is not None:
-                residual0 = compute_rotation_constraint_residual(lines_data, rot0, f_pixels0)
-                if np.isfinite(residual0):
-                    scored.append((residual0, residual0, current_f, rot0))
+            f_base, sensor_width_mm, sensor_height_mm, sensor_fit, pixel_width, pixel_height)
+        if not np.isfinite(f_pixels0) or f_pixels0 <= 1e-8:
+            continue
+        rot0 = solve_camera_rotation_constrained(
+            lines_data, f_pixels0, current_rot_matrix, iterations=scan_iterations)
+        if rot0 is None:
+            continue
+        residual0 = compute_rotation_constraint_residual(lines_data, rot0, f_pixels0)
+        if not np.isfinite(residual0):
+            continue
+        penalty0 = proximity_weight * abs(math.log(max(f_base, 1e-6) / current_f))
+        scored.append((residual0 + penalty0, residual0, f_base, rot0))
 
     if not scored:
         return {
@@ -1697,7 +2271,8 @@ def refine_focal_length_for_constrained_rotation(
     hi = min(2000.0, f_best * 1.12)
     if hi > lo:
         fine_factors = np.linspace(lo / current_f, hi / current_f, fine_count)
-        scored.extend(scan_factors(fine_factors))
+        # warm start：从粗扫最优的姿态出发（相邻焦距的最优姿态差异极小）
+        scored.extend(scan_factors(fine_factors, seed=best[3]))
         scored.sort(key=lambda item: item[0])
 
     # 阶段三: 局部连续精化。
@@ -1705,7 +2280,7 @@ def refine_focal_length_for_constrained_rotation(
     # 的系统偏差：实测理想数据下真值 35.000 只能收敛到 34.63~35.36，残差停在
     # ~5e-4，而真值处残差是 ~8e-8（差 4 个数量级）。这里对细扫前几名分别做
     # 三分搜索连续逼近 —— 只对第 1 名做会在残差多峰时陷入局部极小。
-    for _score, _res, f_ref, _rot in scored[:(2 if fast else 3)]:
+    for _score, _res, f_ref, _rot in scored[:refine_candidates]:
         lo_f = max(8.0, f_ref * 0.94)
         hi_f = min(2000.0, f_ref * 1.06)
         for _ in range(refine_steps):
@@ -1713,8 +2288,8 @@ def refine_focal_length_for_constrained_rotation(
                 break
             m1 = lo_f + (hi_f - lo_f) / 3.0
             m2 = hi_f - (hi_f - lo_f) / 3.0
-            s1 = score_candidate(m1, iterations=local_iterations)
-            s2 = score_candidate(m2, iterations=local_iterations)
+            s1 = score_candidate(m1, iterations=local_iterations, seed=_rot)
+            s2 = score_candidate(m2, iterations=local_iterations, seed=_rot)
             if s1 is not None:
                 scored.append(s1)
             if s2 is not None:
@@ -1734,32 +2309,217 @@ def refine_focal_length_for_constrained_rotation(
 
     scored.sort(key=lambda item: item[0])
 
-    _best_score, best_residual, best_f_mm, _best_rot = scored[0]
-
+    # 基线取消失点法给出的扫描中心 current_f，与 1.2.0 一致。
+    # 判据问的是"扫描结果比消失点法的估计更好吗"（几何一致性）；曾改成问
+    # "比相机现状更好吗"（保守性），与上面的惩罚项形成双重保守，结果焦距
+    # 几乎永远不动（实测用户工程五种初值离散度 1.696mm，1.2.0 只有 0.587mm）。
+    # current_f 本身离谱时，由 strong_evidence（残差数量级优势）与
+    # reliable=False 时返回 smooth_ref 两处兜底。
     baseline_items = [item for item in scored if abs(item[2] - current_f) < 1e-6]
+    if not baseline_items:
+        baseline_items = [item for item in scored if abs(item[2] - smooth_ref) < 1e-6]
     if baseline_items:
+        baseline_score = baseline_items[0][0]
         baseline_residual = baseline_items[0][1]
     else:
-        baseline_residual = best_residual
+        baseline_score = scored[0][0]
+        baseline_residual = scored[0][1]
+
+    # 强证据：真实解在残差上有数量级优势时，改用"纯残差"重新择优，跳过 proximity
+    # penalty。实测（无噪声、真值 35mm、相机初值 135mm）：消失点给出的 current_f=35mm
+    # 残差是 **0**，但它的 penalty = 0.008 × |ln(35/135)| = 0.0108；而 smooth_ref=135mm
+    # 的残差只有 0.0096 且 penalty 为 0 —— 按总分排序会把正确答案罚输，焦距原样停在
+    # 135mm（误差 285.7%，实测 10/15 例）。penalty 的本意是"抑制噪声引起的随机漂移"，
+    # 不该压过"残差接近 0"这种强证据。噪声下最优残差实测 0.0125~0.0316（±8px），
+    # 与基线之比 0.65~0.88，远达不到 0.5 的门槛，所以这个分支不会在噪声下误触发。
+    by_residual = sorted(scored, key=lambda item: item[1])
+    strong_evidence = (
+        np.isfinite(by_residual[0][1])
+        and np.isfinite(baseline_residual)
+        and baseline_residual > 1e-9
+        and by_residual[0][1] < baseline_residual * 0.5
+    )
+    if strong_evidence:
+        best_score, best_residual, best_f_mm, _best_rot = by_residual[0]
+    else:
+        best_score, best_residual, best_f_mm, _best_rot = scored[0]
+
+    # 残差曲线是否真的存在内部极小？
+    # 实测（T1 全矩阵：level_side 视角 = 相机几乎水平、X/Y 轴接近平行于像面）：
+    # ±8px 端点噪声下残差随焦距**单调递减**（18mm→0.0337、35mm→0.0245、
+    # 80.7mm→0.0224、140mm→0.0217），根本没有谷底 —— 因为约束残差 |axis·n|
+    # 里的法线 n=(a,b,-c/f) 在 f 增大时位置分量 c/f 趋于 0，约束退化成"只看
+    # 线段方向"，系统变松、残差自然变小，并不是大焦距更对。此时"最小残差"
+    # 会落在扫描区间的端点上，说明焦距不可辨识，必须保持初值，否则会解出
+    # 80.7mm 这种偏差 +131% 的结果（实测 130.6% 的焦距误差正是这么来的）。
+    f_lo = min(item[2] for item in scored)
+    f_hi = max(item[2] for item in scored)
+    span = f_hi - f_lo
+    at_edge = False
+    if span > 1e-6:
+        edge_band = span * 0.05
+        at_edge = best_f_mm <= f_lo + edge_band or best_f_mm >= f_hi - edge_band
 
     improvement = baseline_residual - best_residual
     improvement_ratio = improvement / max(abs(baseline_residual), 1e-6)
+    # "焦距是否改变了"必须相对基线（相机当前焦距）判断，而不是相对 current_f。
+    # current_f 是消失点给的扫描中心，它本身可能就是离谱值；若拿它当参照，
+    # "扫描最优恰好等于 current_f"会被判成"没改变"而否掉，于是又退回 current_f，
+    # 逻辑上自相矛盾。实测 bottom_up/YZ/n8/s2：current_f = 64.02mm（真值 35mm），
+    # 扫描最优与基线的残差只差 0.00011，旧判据 reliable=False 后原样返回 64.02mm，
+    # 焦距误差 82.9%；改用基线作参照后正确保持相机初值 50mm（误差 42.9%）。
+    # 死区统一为 1%（与 1.2.0 一致）。实时档曾用 5%，但用户工程实测焦距对
+    # 初值的离散度已达 1.696mm（约 4%），5% 死区会把真实的变化一起吸收，
+    # 表现为"焦距不动"。抖动改由 reliable 判据（相对残差改善 + 谷底抬升）把关。
     changed = abs(best_f_mm - current_f) > max(0.1, current_f * 0.01)
 
-    reliable = (
-        changed
-        and np.isfinite(baseline_residual)
-        and np.isfinite(best_residual)
-        and (
-            best_residual <= baseline_residual * 0.97
-            or improvement >= 0.003
-            or improvement_ratio >= 0.02
+    # 曾经有过一条"消失点法与残差扫描分歧超过 50% 时无条件相信扫描结果"的判据，
+    # 现已移除。它当初是为了救"current_f 是噪声下偏 +131% 的离谱值、却被原样保留"
+    # 这个场景，但那个场景现在由两处更可靠的机制覆盖：① reliable=False 时返回的是
+    # smooth_ref（相机当前焦距）而不是 current_f；② strong_evidence 分支在残差有
+    # 数量级优势时直接采用扫描结果。反过来，这条判据在噪声下极危险 —— 消失点漂到
+    # 4304px 时 current_f 本身就离谱，扫描结果同样离谱，两者的"分歧"反而是常态。
+    # 实测（±8px、初值=真值 35mm、30 种子 × 5 视角 = 150 例）：带这条判据时 6 例
+    # 被拉到 48.4% 的焦距误差，移除后归零。
+
+    # "最优残差相对基线有多大改善"是判断谷底是否真实的信号。
+    #
+    # 曾经用**绝对阈值**：best_residual × pixel_height <= 2.0（按合成 ±8px 端点
+    # 噪声标定，对应约 ±1px 噪声）。但真实用户是**手绘**线条，误差是系统性的
+    # （线段不严格交于同一消失点），它把整条残差曲线整体抬高 —— 实测用户工程
+    # （I:\空净\T90\首图2.blend，4096x4096）该值落在 47~590 之间，恒大于 2.0，
+    # 判据等于失效，焦距更新全押在 valley_ok 一条上，用户看到的就是"焦距不动"。
+    # 改成相对基线（消失点法的估计）的改善比例后与手绘精度无关；仍乘 pixel_height
+    # 只是为了量纲统一，比值本身已与分辨率无关。
+    residual_norm = best_residual * float(pixel_height) if np.isfinite(best_residual) else float('inf')
+    baseline_norm = baseline_residual * float(pixel_height) if np.isfinite(baseline_residual) else float('inf')
+
+    # 谷底"两侧抬升"：真谷底的两端残差都会明显高于谷底，而端点噪声造成的假谷底
+    # 至少有一侧是平的。
+    #
+    # 为什么不用"谷底相对两端的深度比值"（曾用 valley_sharpness = best/edge_ref）：
+    # 那个比值随扫描范围变化。实测合成 ±8px、XYZ、1920x1080 的第 3 号种子，在
+    # 20~70mm 范围内比值是 0.98（看起来"很平"，像噪声），但把范围放宽到 8~80mm
+    # 后比值降到 0.549 —— 于是"深度 <= 0.7"反而把它误判成"真谷底"而放行，焦距从
+    # 35mm 漂到 10.8mm。同一批数据换个扫描范围就换个结论，说明它不是稳定判据。
+    #
+    # 改用"两侧各自的抬升倍数"：真谷底要求两端残差都至少比谷底高 50%。
+    # 实测用户工程（I:\空净\T90\首图2.blend，4096x4096）：谷底 40mm 处 167.2，
+    # 低端 16mm 处 483.8（+189%）、高端 135mm 处 302.7（+81%），两侧都过；
+    # 合成 ±8px 第 3 号种子：谷底 12mm 处 0.0281，低端 8mm 处 0.0344（仅 +22%），
+    # 被挡住。谷底落在扫描区间边缘时抬升为 0，判为不可靠（保守，符合预期）。
+    valley_lift = 0.0
+    if len(scored) >= 3 and np.isfinite(best_residual) and best_residual > 1e-9:
+        by_focal = sorted(scored, key=lambda item: item[2])
+        best_index = min(range(len(by_focal)), key=lambda i: by_focal[i][1])
+        lifts = []
+        if best_index > 0:
+            lifts.append((float(by_focal[0][1]) - float(best_residual)) / float(best_residual))
+        if best_index < len(by_focal) - 1:
+            lifts.append((float(by_focal[-1][1]) - float(best_residual)) / float(best_residual))
+        if lifts:
+            valley_lift = float(min(lifts))
+    valley_ok = bool(np.isfinite(valley_lift) and valley_lift >= 0.5)
+
+    if fast:
+        # 实时模式：判据要求"残差有足够大的绝对改善"，而不是相对改善 —— 相对判据
+        # 挡不住噪声（0.003 相对 0.006 已经算 50% 的"改善"了）。真正把噪声挡在
+        # 外面的是下面的 residual_norm <= 2.0，所以这里的 improvement 阈值可以放得
+        # 很低：实测无噪声、初值 50mm、真值 35mm 时，各视角 50mm 处的残差只有
+        # 0.003~0.008，沿用 0.008 会让实时档 50 例里只有 1 例跟随焦距 —— 用户拖拽
+        # 线条时焦距纹丝不动。改成 0.002 后无噪声与亚像素噪声下正常精化，±1px 以上
+        # 由 residual_norm 拦住（实测 ±1px 时 residual_norm 中位数 2.4 > 2.0）。
+        reliable = (
+            changed
+            and np.isfinite(best_residual)
+            and np.isfinite(baseline_residual)
+            and improvement >= 0.002
         )
-    )
+        reliable = reliable and not at_edge and (residual_norm <= baseline_norm * 0.6 or valley_ok)
+    else:
+        # 精确档同样要求"残差有足够大的绝对改善"，理由与实时档一致，只是阈值可以
+        # 略松一点。实测（±8px、初值=真值 35mm、30 种子 × 5 视角 = 150 例）：
+        # 噪声下 best_residual/baseline_residual 的中位数是 0.966，improvement 最大
+        # 0.0092 —— 旧的 0.97 / 0.003 / 0.02 三条判据全部落在噪声波动范围内，结果
+        # 9/150 例被拉到 48.4% 的焦距误差。收紧到 0.8 / 0.008 / 0.2 后噪声波动
+        # 完全够不着；而"初值远离真值"时残差有数量级优势（无噪声初值 135mm 时
+        # best_residual=0、baseline≈0.0096），由 strong_evidence 分支接管，不受影响。
+        # 相对改善阈值从 0.8 / 0.008 / 0.2 放宽到 0.95 / 0.002 / 0.05。
+        #
+        # 旧阈值是按"合成 ±8px 端点噪声"标定的：那时 best/baseline 的中位数是
+        # 0.966，所以 0.97/0.003/0.02 全部落在噪声波动内、必须收紧到 0.8 才挡得住
+        # 9/150 例 48.4% 的焦距误差。但真实用户是**手绘**线条，误差是系统性的
+        # （线段不严格交于同一消失点），它把整条残差曲线整体抬高、却让谷底位置
+        # 非常稳定 —— 实测用户工程 best/baseline = 0.875、谷底锐度 0.35，旧阈值
+        # 0.8 差一点就把它挡在外面，用户看到的就是"焦距永远不动"。
+        # 真正区分"手绘系统误差"与"端点噪声"的是 valley_ok（谷底两侧抬升，实测
+        # 用户工程两侧 +189%/+81%、合成 ±8px 只有 +22%），所以这里可以放宽，由
+        # (residual_norm <= 2.0 or valley_ok) 统一把关。
+        reliable = (
+            changed
+            and np.isfinite(baseline_residual)
+            and np.isfinite(best_residual)
+            and (
+                best_residual <= baseline_residual * 0.95
+                or improvement >= 0.002
+                or improvement_ratio >= 0.05
+            )
+        )
+        reliable = reliable and not at_edge and (residual_norm <= baseline_norm * 0.6 or valley_ok)
+
+    # 焦距判为不可靠时（"这次没解出可信的焦距，先不动"），在"相机当前焦距"
+    # (smooth_ref) 与"消失点法给出的扫描中心"(current_f) 之间**选残差更小的那个**，
+    # 而不是无条件退回 smooth_ref。
+    #
+    # 为什么不能无条件退回 smooth_ref：smooth_ref 是 cam.data.lens，也就是用户
+    # 随手填的初值，它可能比消失点法的估计差得多。实测用户工程
+    # （I:\空净\T90\首图2.blend，4096x4096、真值约 44.25mm）：把相机 lens 设成
+    # 20mm 再点解算，消失点法给出扫描中心 42.987mm（残差 0.012013），扫描最优
+    # 44.25mm（残差 0.011533）—— 改善只有 4%，exact 判据（0.95 / 0.002 / 0.05）
+    # 全部够不着，于是 reliable=False，退回 smooth_ref = 20mm，残差从 0.0936
+    # 恶化到 0.0955。用户看到的就是"点了匹配相机，焦距纹丝不动"，而且用的还是
+    # 自己随手填的错误初值 —— 这正是用户报告的核心症状。
+    #
+    # 两个候选本来就都已经在 scored 里（见上面把它们纳入候选的说明），且用的是
+    # 同一套解算流程，残差可直接比较，不需要额外计算。反过来，相机当前焦距确实
+    # 比扫描中心更好时（实测同一工程：相机 44.0901mm 残差 0.011599 < 扫描中心
+    # 42.987mm 的 0.012013），仍然保持相机现状，不会无故改动。
+    #
+    # 调用方没提供 smooth_ref_mm 时 smooth_ref 就等于 current_f，候选只剩一个，
+    # 行为与旧版一致。
+    locked_candidates = [
+        item for item in scored
+        if abs(item[2] - current_f) < 1e-6
+        or (smooth_ref_mm is not None and abs(item[2] - smooth_ref) < 1e-6)
+    ]
+    if locked_candidates:
+        locked_f = float(min(locked_candidates, key=lambda item: item[1])[2])
+    else:
+        locked_f = float(smooth_ref if smooth_ref_mm is not None else current_f_mm)
+
+    # 细分"不可靠"的两种含义，供调用方给出准确提示。
+    #
+    # 曾经只有 refined / locked 两种状态，于是"焦距其实已经正确"也被报成
+    # "约束不足，焦距已锁定" —— 实测 XYZ 各 3 条线、无噪声、相机初值 50mm、
+    # 真值 35mm：消失点法给出 current_f = 35mm（残差 0），扫描最优同样是 35mm，
+    # 于是 changed=False → reliable=False，而焦距结果完全正确，用户却看到
+    # "焦距已锁定"，与面板上 50→35 的实际变化自相矛盾。
+    #
+    # consistent：不可靠，但残差比较显示"消失点给出的焦距"就是最优 —— 焦距
+    #             无需改变（不是保守退回），调用方不必提示。
+    # fallback ：不可靠，且退回的是"相机当前焦距"（smooth_ref）—— 这才是真正
+    #             需要提示用户"这次没解出可信焦距"的情况。
+    if reliable:
+        chosen_state = 'refined'
+    elif abs(locked_f - current_f) <= 1e-6:
+        chosen_state = 'consistent'
+    else:
+        chosen_state = 'fallback'
 
     return {
-        'f_mm': float(best_f_mm if reliable else current_f_mm),
+        'f_mm': float(best_f_mm if reliable else locked_f),
         'reliable': bool(reliable),
+        'state': chosen_state,
         'baseline_residual': float(baseline_residual),
         'best_residual': float(best_residual),
     }
